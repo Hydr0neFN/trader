@@ -291,7 +291,8 @@ ANALYST_SYSTEM = (
 # Tried in order — best quality first. 429 = quota/paid-wall (skip), 404 = missing
 # (skip), 503 = temporary overload (one retry then skip to next).
 GEMINI_MODEL_PRIORITY = [
-    "gemini-3.1-pro-preview",       # best — may be quota-gated on free tier
+    "gemini-3.5-flash",             # newest — priority for API fallback
+    "gemini-3.1-pro-preview",       # may be quota-gated on free tier
     "gemini-3-pro-preview",         # Gemini 3 Pro
     "gemini-3.1-flash-lite-preview", # 3.1 Flash — free tier, sometimes overloaded
     "gemini-3-flash-preview",       # Gemini 3 Flash — confirmed free tier
@@ -495,7 +496,7 @@ GEMINI_CLI_PATH       = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
 # exhausts the loop drops to Flash on the next iteration. Override via
 # GEMINI_CLI_EXIT_MODELS env (comma-separated). Singular GEMINI_CLI_EXIT_MODEL
 # is honoured for backward compat (becomes the head of the chain).
-_default_cli_chain = "gemini-3.1-pro-preview,gemini-3-pro-preview,gemini-3-flash-preview,gemini-2.5-flash"
+_default_cli_chain = "gemini-3.5-flash,gemini-3.1-pro-preview,gemini-3-pro-preview,gemini-3-flash-preview,gemini-2.5-flash"
 _legacy_single = os.environ.get("GEMINI_CLI_EXIT_MODEL")
 GEMINI_CLI_EXIT_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_CLI_EXIT_MODELS", _legacy_single or _default_cli_chain).split(",")
