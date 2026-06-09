@@ -1,0 +1,268 @@
+{% extends "base.html" %}
+{% block title %}History — Trader Dashboard{% endblock %}
+
+{% block content %}
+<h5 class="text-white mb-3"><i class="bi bi-clock-history me-2"></i>Trade History</h5>
+
+<!-- Filters -->
+<div class="card mb-3">
+  <div class="card-body py-2">
+    <form class="row g-2 align-items-end" method="get">
+      <div class="col-6 col-md-3">
+        <label class="form-label" style="font-size:.78rem;color:#8b949e;">Ticker</label>
+        <select name="ticker" class="form-select form-select-sm bg-dark text-white border-secondary">
+          <option value="">All</option>
+          {% for t in all_tickers %}
+          <option value="{{ t }}" {% if t == ticker_filter %}selected{% endif %}>{{ t }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-6 col-md-3">
+        <label class="form-label" style="font-size:.78rem;color:#8b949e;">From</label>
+        <input type="date" name="from" value="{{ date_from }}" class="form-control form-control-sm bg-dark text-white border-secondary">
+      </div>
+      <div class="col-6 col-md-3">
+        <label class="form-label" style="font-size:.78rem;color:#8b949e;">To</label>
+        <input type="date" name="to" value="{{ date_to }}" class="form-control form-control-sm bg-dark text-white border-secondary">
+      </div>
+      <div class="col-6 col-md-3 d-flex gap-2">
+        <button type="submit" class="btn btn-primary btn-sm w-100">Filter</button>
+        <a href="/history" class="btn btn-outline-secondary btn-sm w-100">Reset</a>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% if not rows %}
+<div class="card">
+  <div class="card-body text-center text-secondary py-5">
+    <i class="bi bi-inbox display-4"></i>
+    <p class="mt-3">No trades match your filter.</p>
+  </div>
+</div>
+{% else %}
+<div class="card">
+  <div class="table-responsive">
+    <table class="table table-dark table-hover mb-0 align-middle" id="historyTable" style="table-layout:fixed;word-break:break-word;">
+      <colgroup>
+        <col style="width:140px;"><!-- Time -->
+        <col style="width:64px;"> <!-- Ticker -->
+        <col style="width:90px;"> <!-- Action -->
+        <col style="width:90px;"> <!-- Verdict -->
+        <col style="width:48px;"> <!-- Qty -->
+        <col style="width:80px;"> <!-- Price -->
+        <col style="width:52px;"> <!-- Conf. -->
+        <col>                     <!-- Reasoning — takes remaining space -->
+      </colgroup>
+      <thead style="background:#1c2128; font-size:.8rem; text-transform:uppercase; letter-spacing:.5px; color:#8b949e;">
+        <tr>
+          <th class="ps-3">Time</th>
+          <th>Ticker</th>
+          <th>Action</th>
+          <th>Verdict</th>
+          <th class="text-end">Qty</th>
+          <th class="text-end">Price</th>
+          <th class="text-end">Conf.</th>
+          <th class="pe-3">Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr class="history-row" style="cursor:pointer;"
+            data-row='{{ row_json(r) | e }}'>
+          <td class="ps-3 text-secondary" style="white-space:nowrap;font-size:.8rem;">
+            {{ r.timestamp | fmt_ts }}
+          </td>
+          <td class="fw-bold text-white">{{ r.ticker }}</td>
+          <td>
+            {% set act = r.action | upper %}
+            {% if r._type == 'vetoed' %}
+              <span class="badge badge-veto">{{ act }}</span>
+            {% elif act == 'BUY' %}
+              <span class="badge badge-buy">BUY</span>
+            {% elif act == 'SELL' %}
+              <span class="badge badge-sell">SELL</span>
+            {% else %}
+              <span class="badge badge-hold">{{ act }}</span>
+            {% endif %}
+            {% if r.exit_type %}
+            <br><span class="badge mt-1" style="background:#e36209;font-size:.68rem;">
+              <i class="bi bi-arrow-bar-down me-1"></i>{{ r.exit_type }}
+            </span>
+            {% endif %}
+          </td>
+          <td>
+            {% if r._type == 'vetoed' %}
+              <span class="badge badge-veto"><i class="bi bi-x-circle me-1"></i>VETO</span>
+            {% else %}
+              <span class="badge badge-approved"><i class="bi bi-check-circle me-1"></i>APPROVED</span>
+            {% endif %}
+          </td>
+          <td class="text-end">{{ r.qty if r.qty is defined and r.qty != None else '—' }}</td>
+          <td class="text-end">
+            {% if r.price is defined and r.price != None %}{{ r.price | fmt_currency }}{% else %}—{% endif %}
+          </td>
+          <td class="text-end">
+            {% if r.confidence is defined and r.confidence != None %}{{ r.confidence }}%{% else %}—{% endif %}
+          </td>
+          <td class="pe-3 reasoning-text" style="max-width:260px;white-space:normal;word-break:break-word;overflow-wrap:anywhere;">{{ r.reasoning | default('—') | truncate(120) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-footer text-secondary" style="font-size:.78rem;">
+    {{ rows | length }} record(s) &nbsp;·&nbsp; <i class="bi bi-hand-index me-1"></i>Click a row to view full detail
+  </div>
+</div>
+{% endif %}
+
+<!-- Detail modal -->
+<div class="modal fade" id="detailModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content" style="background:#161b22; border:1px solid #30363d;">
+      <div class="modal-header" style="border-color:#30363d;">
+        <h6 class="modal-title text-white" id="modalTitle">Trade Detail</h6>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="modalBody" style="font-size:.85rem;overflow-x:hidden;"></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Field display config ──────────────────────────────────────────────────────
+const FIELD_LABELS = {
+  timestamp:           'Time',
+  run_timestamp:       'Run Time',
+  ticker:              'Ticker',
+  action:              'Action',
+  recommendation:      'Gemini Rec.',
+  final_action:        'Final Action',
+  gemini_recommendation: 'Gemini Rec.',
+  gemini_confidence:   'Gemini Confidence',
+  gemini_model:        'Gemini Model',
+  gemini_reasoning:    'Gemini Reasoning',
+  confidence:          'Confidence',
+  reasoning:           'Reasoning',
+  hf_sentiment:        'HF Sentiment',
+  hf_confidence:       'HF Confidence',
+  hf_model:            'HF Model',
+  hf_reasoning:        'HF Reasoning',
+  haiku_verdict:       'Haiku Verdict',
+  haiku_justification: 'Haiku Justification',
+  veto_reasons:        'Veto Reasons',
+  qty:                 'Qty',
+  price:               'Fill Price',
+  order_id:            'Order ID',
+  exit_type:           'Exit Type',
+  sim_sec_fee:         'Sim SEC Fee',
+  sim_finra_taf:       'Sim FINRA TAF',
+  sim_slippage:        'Sim Slippage',
+  sim_total_fee:       'Sim Total Fee',
+  current_price:       'Price at Run',
+  daily_change_pct:    'Daily Change %',
+  ma5:  'MA5',  ma20: 'MA20', ma50: 'MA50',
+  volume: 'Volume',
+};
+
+// Fields to render in the modal (order matters)
+const FIELD_ORDER = [
+  'timestamp','run_timestamp','ticker','recommendation','gemini_recommendation',
+  'gemini_confidence','gemini_model','gemini_reasoning',
+  'hf_sentiment','hf_confidence','hf_model','hf_reasoning',
+  'haiku_verdict','haiku_justification','veto_reasons',
+  'final_action','action',
+  'qty','price','order_id','exit_type',
+  'sim_sec_fee','sim_finra_taf','sim_slippage','sim_total_fee',
+  'confidence','reasoning',
+  'current_price','daily_change_pct','ma5','ma20','ma50','volume',
+];
+
+function fmtValue(key, val) {
+  if (val === null || val === undefined || val === '') return '<span class="text-secondary">—</span>';
+  if (Array.isArray(val)) {
+    return val.map((v, i) =>
+      `<div${i < val.length - 1 ? ' style="margin-bottom:6px;"' : ''}>${escHtml(String(v))}</div>`
+    ).join('');
+  }
+  if (key === 'haiku_verdict') {
+    const cls = val === 'APPROVED' ? 'badge-approved' : 'badge-veto';
+    return `<span class="badge ${cls}">${escHtml(val)}</span>`;
+  }
+  if (key === 'hf_sentiment' || key === 'recommendation' || key === 'gemini_recommendation') {
+    const map = {BUY:'badge-buy', SELL:'badge-sell', HOLD:'badge-hold', BULLISH:'badge-buy', BEARISH:'badge-sell', VETOED:'badge-veto'};
+    const cls = map[String(val).toUpperCase()] || 'bg-secondary';
+    return `<span class="badge ${cls}">${escHtml(String(val))}</span>`;
+  }
+  if (key === 'timestamp' || key === 'run_timestamp') {
+    try {
+      const d = new Date(val);
+      return escHtml(d.toLocaleString('en-US', {timeZone:'America/New_York',hour12:false}) + ' ET');
+    } catch(e) { return escHtml(String(val)); }
+  }
+  if (typeof val === 'number') {
+    if (key.endsWith('_pct') || key === 'daily_change_pct') return (val >= 0 ? '+' : '') + val.toFixed(2) + '%';
+    if (key === 'price' || key === 'current_price' || key.includes('value')) return '$' + val.toLocaleString('en-US',{minimumFractionDigits:2});
+    if (key === 'ma5' || key === 'ma20' || key === 'ma50') return '$' + val.toFixed(2);
+    if (key.startsWith('sim_')) return '$' + val.toFixed(4);
+    if (key === 'volume') return val.toLocaleString('en-US');
+    return String(val);
+  }
+  return escHtml(String(val));
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function renderModal(row) {
+  const ticker = row.ticker || '?';
+  const act    = (row.action || row.recommendation || '').toUpperCase();
+  const actBadge = {BUY:'badge-buy',SELL:'badge-sell',HOLD:'badge-hold',VETOED:'badge-veto'}[act] || 'bg-secondary';
+
+  document.getElementById('modalTitle').innerHTML =
+    `<span class="fw-bold text-white me-2">${escHtml(ticker)}</span>` +
+    `<span class="badge ${actBadge} me-2">${escHtml(act || '?')}</span>` +
+    `<span class="text-secondary" style="font-size:.78rem;">${fmtValue('timestamp', row.timestamp)}</span>`;
+
+  // Build ordered rows first, then any extra keys
+  const rendered = new Set();
+  let html = '<table class="table table-sm table-dark mb-0" style="font-size:.83rem;table-layout:fixed;width:100%;">' +
+             '<colgroup><col style="width:150px;"><col></colgroup>' +
+             '<tbody>';
+
+  function addRow(key) {
+    if (rendered.has(key) || !(key in row)) return;
+    rendered.add(key);
+    const label = FIELD_LABELS[key] || key.replace(/_/g,' ');
+    const isLong = typeof row[key] === 'string' && row[key].length > 80;
+    html += `<tr>
+      <td style="color:#8b949e;white-space:nowrap;vertical-align:top;">${escHtml(label)}</td>
+      <td style="white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;overflow:hidden;">${fmtValue(key, row[key])}</td>
+    </tr>`;
+  }
+
+  FIELD_ORDER.forEach(addRow);
+  // Remaining keys not in FIELD_ORDER
+  Object.keys(row).forEach(k => { if (!rendered.has(k)) addRow(k); });
+
+  html += '</tbody></table>';
+  document.getElementById('modalBody').innerHTML = html;
+}
+
+// Wire up row clicks
+const modal = new bootstrap.Modal(document.getElementById('detailModal'));
+document.querySelectorAll('.history-row').forEach(tr => {
+  tr.addEventListener('click', function() {
+    try {
+      const row = JSON.parse(this.dataset.row);
+      renderModal(row);
+      modal.show();
+    } catch(e) { console.error('Detail parse error', e); }
+  });
+});
+</script>
+{% endblock %}

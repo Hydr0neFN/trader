@@ -1,0 +1,25 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs / data
+*.log
+trade_logs/
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editor / OS
+*.bak
+.DS_Store
+Thumbs.db

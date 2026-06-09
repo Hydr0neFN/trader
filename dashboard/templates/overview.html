@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block title %}Overview — Trader Dashboard{% endblock %}
+
+{% block content %}
+{% if error %}
+<div class="alert alert-danger"><i class="bi bi-exclamation-triangle me-2"></i>Alpaca API error: {{ error }}</div>
+{% endif %}
+
+<!-- Stat cards -->
+<div class="row g-3 mb-4">
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Portfolio Value</div>
+        <div class="stat-value text-white">{{ account.portfolio_value | fmt_currency }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Cash</div>
+        <div class="stat-value text-white">{{ account.cash | fmt_currency }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Day P&amp;L</div>
+        <div class="stat-value {% if account.day_pnl and account.day_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
+          {{ account.day_pnl | fmt_currency }}
+          <small style="font-size:.9rem;">({{ account.day_pnl_pct | fmt_pct }})</small>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Total P&amp;L</div>
+        <div class="stat-value {% if account.total_pnl and account.total_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
+          {{ account.total_pnl | fmt_currency }}
+          <small style="font-size:.9rem;">({{ account.total_pnl_pct | fmt_pct }})</small>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Simulated Fees</div>
+        <div class="stat-value pnl-neg">
+          {{ cumulative_sim_fees | fmt_currency }}
+        </div>
+        <div style="font-size:.72rem; color:#8b949e; margin-top:4px;">SEC + FINRA TAF + slippage</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Net P&amp;L <span style="font-size:.7rem;color:#8b949e;">(after sim fees)</span></div>
+        <div class="stat-value {% if net_pnl and net_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
+          {{ net_pnl | fmt_currency }}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Open Positions</div>
+        <div class="stat-value text-primary">{{ account.open_positions | default('—') }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Last Run</div>
+        <div style="font-size:.85rem; color:#cdd9e5; margin-top:6px;">{{ last_run_ts | fmt_ts }}</div>
+        {% if last_run %}
+        <div style="font-size:.78rem; color:#8b949e;">
+          ✓ {{ last_run.approved }} approved &nbsp;·&nbsp; ✗ {{ last_run.vetoed }} vetoed
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Portfolio chart -->
+<div class="card mb-4">
+  <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+    <span><i class="bi bi-bar-chart-line me-2"></i>Portfolio Value Over Time</span>
+    <div class="btn-group btn-group-sm" role="group" id="periodBtns">
+      <button type="button" class="btn btn-outline-secondary" data-period="1D">1D</button>
+      <button type="button" class="btn btn-outline-secondary" data-period="1W">1W</button>
+      <button type="button" class="btn btn-outline-secondary" data-period="1M">1M</button>
+      <button type="button" class="btn btn-outline-secondary active" data-period="ALL">ALL</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="chart-container">
+      <canvas id="portfolioChart"></canvas>
+    </div>
+    {% if not chart_data or chart_data == '[]' %}
+    <p class="text-secondary text-center mt-3" style="font-size:.85rem;">
+      No history yet — data appears after the first completed trading run.
+    </p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const allData = {{ chart_data | safe }};
+
+let chart = null;
+
+function buildChart(data) {
+  const ctx = document.getElementById('portfolioChart').getContext('2d');
+  const grad = ctx.createLinearGradient(0, 0, 0, 260);
+  grad.addColorStop(0, 'rgba(31,111,235,.35)');
+  grad.addColorStop(1, 'rgba(31,111,235,0)');
+
+  if (chart) chart.destroy();
+
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.label),
+      datasets: [{
+        label: 'Portfolio Value',
+        data:   data.map(d => d.value),
+        borderColor: '#1f6feb',
+        backgroundColor: grad,
+        borderWidth: 2,
+        pointRadius: data.length > 20 ? 0 : 3,
+        pointHoverRadius: 5,
+        fill: true,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: c => '$' + c.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2})
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 },
+          grid:  { color: '#21262d' }
+        },
+        y: {
+          ticks: {
+            color: '#8b949e',
+            callback: v => '$' + v.toLocaleString('en-US', {minimumFractionDigits:0})
+          },
+          grid: { color: '#21262d' }
+        }
+      }
+    }
+  });
+}
+
+function filterByPeriod(period) {
+  if (!allData.length) return [];
+  const now   = new Date(allData[allData.length - 1].ts);
+  const cutoff = new Date(now);
+  if (period === '1D')      cutoff.setDate(cutoff.getDate() - 1);
+  else if (period === '1W') cutoff.setDate(cutoff.getDate() - 7);
+  else if (period === '1M') cutoff.setMonth(cutoff.getMonth() - 1);
+  else return allData;                      // ALL
+  return allData.filter(d => new Date(d.ts) >= cutoff);
+}
+
+if (allData.length > 0) {
+  buildChart(allData);
+
+  document.querySelectorAll('#periodBtns button').forEach(btn => {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('#periodBtns button').forEach(b => b.classList.remove('active'));
+      this.classList.add('active');
+      buildChart(filterByPeriod(this.dataset.period));
+    });
+  });
+}
+</script>
+{% endblock %}

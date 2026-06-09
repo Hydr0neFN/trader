@@ -1,0 +1,295 @@
+{% extends "base.html" %}
+{% block title %}Decisions — Trader Dashboard{% endblock %}
+
+{% block content %}
+<!-- Toolbar -->
+<div class="d-flex align-items-start justify-content-between gap-3 mb-3 flex-wrap">
+  <h5 class="text-white mb-0 mt-1"><i class="bi bi-diagram-3 me-2"></i>Decision Chain</h5>
+
+  {% if run_timestamps %}
+  <form method="get" id="filterForm" class="flex-grow-1" style="max-width:640px;">
+    <input type="hidden" name="run" id="runInput" value="{{ selected_ts }}">
+    <div class="row g-2">
+
+      <!-- Run picker — full width on its own row -->
+      <div class="col-12">
+        <label class="form-label mb-1" style="font-size:.75rem;color:#8b949e;">Run</label>
+        <select class="form-select form-select-sm bg-dark text-white border-secondary"
+                onchange="document.getElementById('runInput').value=this.value; document.getElementById('filterForm').submit();">
+          {% for ts in run_timestamps %}
+          <option value="{{ ts }}" {% if ts == selected_ts %}selected{% endif %}>{{ ts | fmt_ts }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <!-- 2×2 grid for the three secondary filters -->
+      <div class="col-6">
+        <label class="form-label mb-1" style="font-size:.75rem;color:#8b949e;">Ticker</label>
+        <select name="ticker" class="form-select form-select-sm bg-dark text-white border-secondary"
+                onchange="this.form.submit()">
+          <option value="">All</option>
+          {% for t in all_tickers %}
+          <option value="{{ t }}" {% if t == ticker_filter %}selected{% endif %}>{{ t }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-6">
+        <label class="form-label mb-1" style="font-size:.75rem;color:#8b949e;">Action</label>
+        <select name="action" class="form-select form-select-sm bg-dark text-white border-secondary"
+                onchange="this.form.submit()">
+          <option value="">All</option>
+          <option value="BUY"  {% if action_filter == 'BUY'  %}selected{% endif %}>BUY</option>
+          <option value="SELL" {% if action_filter == 'SELL' %}selected{% endif %}>SELL</option>
+          <option value="HOLD" {% if action_filter == 'HOLD' %}selected{% endif %}>HOLD</option>
+        </select>
+      </div>
+      <div class="col-6">
+        <label class="form-label mb-1" style="font-size:.75rem;color:#8b949e;">Type</label>
+        <select name="dtype" class="form-select form-select-sm bg-dark text-white border-secondary"
+                onchange="this.form.submit()">
+          <option value="">All</option>
+          <option value="buy_analysis" {% if dtype_filter == 'buy_analysis' %}selected{% endif %}>Buy Analysis</option>
+          <option value="exit_review"  {% if dtype_filter == 'exit_review'  %}selected{% endif %}>Exit Review</option>
+        </select>
+      </div>
+      <div class="col-6 d-flex align-items-end">
+        {% if run_decisions %}
+        <span class="text-secondary pb-1" style="font-size:.78rem;">
+          {{ run_decisions | length }} ticker(s)
+        </span>
+        {% endif %}
+      </div>
+
+    </div>
+  </form>
+  {% endif %}
+</div>
+
+{% if not run_decisions %}
+<div class="card">
+  <div class="card-body text-center text-secondary py-5">
+    <i class="bi bi-inbox display-4"></i>
+    <p class="mt-3">No decision data yet — appears after the first completed run.</p>
+  </div>
+</div>
+{% else %}
+<div class="row g-3">
+  {% for d in run_decisions %}
+  <div class="col-12 col-lg-6">
+    {% if d.decision_type == 'exit_review' %}
+    {# ── EXIT REVIEW CARD (yellow accent) ─────────────────────────────── #}
+    <div class="card h-100" style="border-color:#d29922;">
+      <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2"
+           style="background:rgba(210,153,34,.12); border-color:#d29922;">
+        <div class="d-flex align-items-center gap-2">
+          <span class="fw-bold text-white fs-6">{{ d.ticker }}</span>
+          <span class="badge" style="background:#d29922;color:#000;font-size:.67rem;">EXIT REVIEW</span>
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+          {% set ea = d.gemini_exit_action | upper if d.gemini_exit_action else 'N/A' %}
+          {% if ea == 'EXIT' %}
+            <span class="badge badge-sell">Gemini: EXIT</span>
+          {% elif ea == 'TRIM' %}
+            <span class="badge" style="background:#e36209;">Gemini: TRIM</span>
+          {% else %}
+            <span class="badge badge-hold">Gemini: HOLD</span>
+          {% endif %}
+          {% if d.haiku_exit_verdict == 'APPROVED' %}
+            <span class="badge badge-approved">Haiku: ✓</span>
+          {% elif d.haiku_exit_verdict == 'VETO' %}
+            <span class="badge badge-veto">Haiku: VETO</span>
+          {% else %}
+            <span class="badge badge-hold">Haiku: N/A</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="card-body">
+        <!-- Position stats -->
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">Position</p>
+        <div class="row g-1 mb-3" style="font-size:.84rem;">
+          <div class="col-4">
+            <span class="text-secondary">Entry</span><br>
+            <span class="text-white fw-semibold">${{ "%.2f" | format(d.entry_price) if d.entry_price else '—' }}</span>
+          </div>
+          <div class="col-4">
+            <span class="text-secondary">Current</span><br>
+            <span class="text-white fw-semibold">${{ "%.2f" | format(d.current_price) if d.current_price else '—' }}</span>
+          </div>
+          <div class="col-4">
+            <span class="text-secondary">Unreal P&L</span><br>
+            <span class="{% if d.unrealized_plpc and d.unrealized_plpc >= 0 %}pnl-pos{% else %}pnl-neg{% endif %} fw-semibold">
+              {{ d.unrealized_plpc | fmt_pct if d.unrealized_plpc is not none else '—' }}
+            </span>
+          </div>
+          <div class="col-4 mt-1">
+            <span class="text-secondary">Days Held</span><br>
+            <span class="text-white">{{ d.days_held if d.days_held is not none else '—' }}</span>
+          </div>
+          <div class="col-4 mt-1">
+            <span class="text-secondary">Confidence</span><br>
+            <span class="text-white">{{ d.gemini_exit_confidence }}%</span>
+          </div>
+          <div class="col-4 mt-1">
+            <span class="text-secondary">Model</span><br>
+            <span class="text-secondary" style="font-size:.72rem;font-family:monospace;">
+              {{ (d.gemini_exit_model or '—') | truncate(18, True) }}
+            </span>
+          </div>
+        </div>
+        <!-- Exit reasoning -->
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">Exit Reasoning</p>
+        <p class="reasoning-text mb-3">{{ d.gemini_exit_reasoning or '—' }}</p>
+        <!-- Haiku justification -->
+        {% if d.haiku_exit_justification %}
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">Haiku Justification</p>
+        <p class="reasoning-text mb-3" style="
+          border-left: 2px solid {% if d.haiku_exit_verdict == 'VETO' %}#da3633{% else %}#2ea043{% endif %};
+          padding-left:.6rem;">{{ d.haiku_exit_justification }}</p>
+        {% endif %}
+        <!-- Final outcome -->
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">Final Action</p>
+        {% set fea = d.final_exit_action | upper if d.final_exit_action else '' %}
+        {% if fea == 'EXITED' %}
+          <span class="badge badge-sell fs-6"><i class="bi bi-box-arrow-right me-1"></i>EXITED</span>
+        {% elif fea == 'TRIMMED' %}
+          <span class="badge fs-6" style="background:#e36209;"><i class="bi bi-scissors me-1"></i>TRIMMED 50%</span>
+        {% elif fea == 'VETOED' %}
+          <span class="badge badge-veto fs-6"><i class="bi bi-x-circle me-1"></i>VETOED</span>
+        {% elif fea == 'HELD' %}
+          <span class="badge badge-hold fs-6"><i class="bi bi-pause-circle me-1"></i>HELD</span>
+        {% else %}
+          <span class="badge bg-secondary fs-6">{{ fea or '—' }}</span>
+        {% endif %}
+      </div>
+    </div>
+
+    {% else %}
+    {# ── BUY ANALYSIS CARD (normal) ───────────────────────────────────── #}
+    <div class="card h-100">
+      <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+        <div class="d-flex align-items-center gap-2">
+          <span class="fw-bold text-white fs-6">{{ d.ticker }}</span>
+          {% if d.gemini_batch %}
+          <span class="badge bg-secondary" style="font-size:.67rem;">batch {{ d.gemini_batch }}</span>
+          {% endif %}
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+          {% if d.gemini_model %}
+          <span class="badge bg-secondary" style="font-size:.7rem;font-family:monospace;">
+            <i class="bi bi-cpu me-1"></i>{{ d.gemini_model }}
+          </span>
+          {% endif %}
+          {% set rec = d.gemini_recommendation | upper %}
+          {% if rec == 'BUY' %}
+            <span class="badge badge-buy">Gemini: BUY</span>
+          {% elif rec == 'SELL' %}
+            <span class="badge badge-sell">Gemini: SELL</span>
+          {% else %}
+            <span class="badge badge-hold">Gemini: HOLD</span>
+          {% endif %}
+          {% set hfs = d.hf_sentiment | upper if d.hf_sentiment else 'N/A' %}
+          {% if hfs == 'BULLISH' %}
+            <span class="badge badge-buy">HF: BULLISH</span>
+          {% elif hfs == 'BEARISH' %}
+            <span class="badge badge-sell">HF: BEARISH</span>
+          {% elif hfs == 'NEUTRAL' %}
+            <span class="badge badge-hold">HF: NEUTRAL</span>
+          {% else %}
+            <span class="badge badge-hold">HF: N/A</span>
+          {% endif %}
+          {% if d.haiku_verdict == 'APPROVED' %}
+            <span class="badge badge-approved">Haiku: ✓</span>
+          {% elif d.haiku_verdict == 'VETO' %}
+            <span class="badge badge-veto">Haiku: VETO</span>
+          {% else %}
+            <span class="badge badge-hold">Haiku: N/A</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="card-body">
+        <!-- Market snapshot -->
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">Market Data</p>
+        <div class="row g-1 mb-3" style="font-size:.84rem;">
+          <div class="col-4">
+            <span class="text-secondary">Price</span><br>
+            <span class="text-white fw-semibold">
+              ${{ "%.2f" | format(d.current_price) if d.current_price else '—' }}
+            </span>
+          </div>
+          <div class="col-4">
+            <span class="text-secondary">Day Chg</span><br>
+            <span class="{% if d.daily_change_pct and d.daily_change_pct >= 0 %}pnl-pos{% else %}pnl-neg{% endif %} fw-semibold">
+              {{ d.daily_change_pct | fmt_pct if d.daily_change_pct is not none else '—' }}
+            </span>
+          </div>
+          <div class="col-4">
+            <span class="text-secondary">Volume</span><br>
+            <span class="text-white">
+              {% if d.volume %}{{ "{:,.0f}".format(d.volume) }}{% else %}—{% endif %}
+            </span>
+          </div>
+          <div class="col-4 mt-1">
+            <span class="text-secondary">MA5</span><br>
+            <span class="text-white">${{ "%.2f" | format(d.ma5) if d.ma5 else '—' }}</span>
+          </div>
+          <div class="col-4 mt-1">
+            <span class="text-secondary">MA20</span><br>
+            <span class="text-white">${{ "%.2f" | format(d.ma20) if d.ma20 else '—' }}</span>
+          </div>
+          <div class="col-4 mt-1">
+            <span class="text-secondary">MA50</span><br>
+            <span class="text-white">${{ "%.2f" | format(d.ma50) if d.ma50 else '—' }}</span>
+          </div>
+        </div>
+        <!-- Gemini reasoning -->
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">
+          Gemini Reasoning
+          {% if d.gemini_confidence is not none %}
+          <span class="ms-2 text-white">{{ d.gemini_confidence }}% confidence</span>
+          {% endif %}
+        </p>
+        <p class="reasoning-text mb-3">{{ d.gemini_reasoning or '—' }}</p>
+        <!-- HF Sentiment -->
+        {% if d.hf_sentiment and d.hf_sentiment != 'N/A' %}
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">
+          HF Sentiment
+          {% if d.hf_confidence is not none %}
+          <span class="ms-2 text-white">{{ d.hf_confidence }}% confidence</span>
+          {% endif %}
+          {% if d.hf_model %}
+          <span class="ms-2 text-secondary" style="font-family:monospace;font-size:.7rem;">{{ d.hf_model }}</span>
+          {% endif %}
+        </p>
+        <p class="reasoning-text mb-3">{{ d.hf_reasoning or '—' }}</p>
+        {% endif %}
+        <!-- Haiku justification -->
+        {% if d.haiku_justification %}
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">Haiku Justification</p>
+        <p class="reasoning-text mb-3" style="
+          border-left: 2px solid {% if d.haiku_verdict == 'VETO' %}#da3633{% else %}#2ea043{% endif %};
+          padding-left:.6rem;">{{ d.haiku_justification }}</p>
+        {% endif %}
+        <!-- Final outcome -->
+        <p class="text-secondary mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;">Final Action</p>
+        {% set fa = d.final_action | upper %}
+        {% if 'EXECUTED' in fa and 'BUY' in fa %}
+          <span class="badge badge-buy fs-6"><i class="bi bi-check2-circle me-1"></i>BUY EXECUTED</span>
+        {% elif 'EXECUTED' in fa and 'SELL' in fa %}
+          <span class="badge badge-sell fs-6"><i class="bi bi-check2-circle me-1"></i>SELL EXECUTED</span>
+        {% elif 'VETOED' in fa %}
+          <span class="badge badge-veto fs-6"><i class="bi bi-x-circle me-1"></i>VETOED</span>
+        {% elif 'HOLD' in fa %}
+          <span class="badge badge-hold fs-6"><i class="bi bi-pause-circle me-1"></i>HOLD</span>
+        {% elif 'PENDING' in fa %}
+          <span class="badge bg-secondary fs-6"><i class="bi bi-hourglass me-1"></i>{{ fa }}</span>
+        {% else %}
+          <span class="badge badge-hold fs-6">{{ fa }}</span>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}
