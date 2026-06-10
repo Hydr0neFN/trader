@@ -51,10 +51,20 @@ def cached(key: str, ttl: float, fn):
     return val
 
 
+_jsonl_cache: dict = {}
+
+
 def read_jsonl(filename: str) -> list:
     path = LOG_DIR / filename
     if not path.exists():
         return []
+    # decisions.jsonl is tens of MB and only changes when the cron runs; parsing
+    # it on every request (×N routes) is what made /history exceed the worker
+    # timeout. Cache by mtime so an unchanged file is parsed at most once.
+    mtime = path.stat().st_mtime
+    hit = _jsonl_cache.get(filename)
+    if hit and hit[0] == mtime:
+        return hit[1]
     lines = []
     with open(path) as fh:
         for line in fh:
@@ -64,7 +74,17 @@ def read_jsonl(filename: str) -> list:
                     lines.append(json.loads(line))
                 except json.JSONDecodeError:
                     pass
+    _jsonl_cache[filename] = (mtime, lines)
     return lines
+
+
+def parse_dt(s):
+    """Parse an ISO timestamp, coercing naive values to UTC. None on failure."""
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
 def fmt_ts(ts_str: str) -> str:
@@ -205,77 +225,81 @@ def history():
     executed = read_jsonl("executed.jsonl")
     vetoed   = read_jsonl("vetoed.jsonl")
 
-    # Build decisions lookup by ticker for detail enrichment
+    # Build decisions lookup by ticker, pre-parsing each run_timestamp ONCE.
+    # decisions.jsonl has tens of thousands of records; parsing datetimes inside
+    # find_decision (called per executed/vetoed row) was O(rows × decisions) and
+    # blew the worker timeout. Pre-parsing here makes each match O(candidates)
+    # comparisons with no repeated parsing.
     all_decisions = read_jsonl("decisions.jsonl")
     dec_by_ticker: dict = {}
     for d in all_decisions:
-        dec_by_ticker.setdefault(d.get("ticker", ""), []).append(d)
-
-    def _parse_dt(s):
-        """Parse an ISO timestamp, coercing naive values to UTC. None on failure."""
-        try:
-            dt = datetime.fromisoformat(s)
-        except (TypeError, ValueError):
-            return None
-        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        dt = parse_dt(d.get("run_timestamp"))
+        dec_by_ticker.setdefault(d.get("ticker", ""), []).append((dt, d))
 
     def find_decision(ticker: str, ts_str: str, want_type: str = "") -> dict:
-        """Return the decisions record closest in time to ts_str for ticker.
+        """Closest-in-time decision for (ticker, ts), within one cron interval.
 
-        Hardened: a single malformed/naive/null run_timestamp must not 500 the
-        whole page (decisions.jsonl is append-only across schema versions), and
-        a match further than one cron interval (30 min) away is rejected so the
-        modal never shows an unrelated run's reasoning. Prefers want_type.
+        Tolerates malformed/naive/null timestamps (no 500), rejects matches more
+        than 30 min away (no unrelated-run reasoning in the modal), prefers
+        want_type. Candidates carry pre-parsed datetimes.
         """
-        ts = _parse_dt(ts_str)
+        ts = parse_dt(ts_str)
         if ts is None:
             return {}
         candidates = dec_by_ticker.get(ticker, [])
         if want_type:
-            typed = [d for d in candidates if d.get("decision_type") == want_type]
+            typed = [(dt, d) for dt, d in candidates if d.get("decision_type") == want_type]
             candidates = typed or candidates
-        parsed = []
-        for d in candidates:
-            dt = _parse_dt(d.get("run_timestamp") or ts_str)
-            if dt is not None:
-                parsed.append((abs((dt - ts).total_seconds()), d))
-        if not parsed:
-            return {}
-        delta, best = min(parsed, key=lambda x: x[0])
-        if delta > 1800:   # > one 30-min cron interval: not the same run
+        best = None
+        best_delta = None
+        for dt, d in candidates:
+            if dt is None:
+                continue
+            delta = abs((dt - ts).total_seconds())
+            if best_delta is None or delta < best_delta:
+                best_delta, best = delta, d
+        if best is None or best_delta > 1800:
             return {}
         return best
 
-    enriched_executed = []
-    for e in executed:
-        want = "buy_analysis" if str(e.get("action", "")).upper() == "BUY" else ""
-        dec = find_decision(e.get("ticker", ""), e.get("timestamp", ""), want)
-        row = {**dec, **e, "_type": "executed"}
-        row["haiku_verdict"] = row.get("haiku_verdict") or "APPROVED"
-        # Exit-driven SELLs are logged with key "reason"; normalize to
-        # "reasoning" so the History table/modal renders it instead of "—".
-        if not row.get("reasoning") and row.get("reason"):
-            row["reasoning"] = row["reason"]
-        enriched_executed.append(row)
+    # Tag raw rows, combine, sort, and FILTER before the expensive per-row
+    # decision enrichment. With thousands of historical vetoes, enriching every
+    # row blew the worker timeout; we only ever render one page, so enrich only
+    # the rows that survive filtering and the page cap.
+    MAX_ROWS = 400
+    raw = [{**e, "_type": "executed"} for e in executed] + \
+          [{**v, "_type": "vetoed"} for v in vetoed]
+    raw.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
 
-    enriched_vetoed = []
-    for v in vetoed:
-        dec = find_decision(v.get("ticker", ""), v.get("timestamp", ""), "buy_analysis")
-        row = {**dec, **v, "_type": "vetoed"}
-        row["action"]        = row.get("recommendation", "")
-        row["haiku_verdict"] = row.get("haiku_verdict") or "VETO"
-        enriched_vetoed.append(row)
-
-    combined = enriched_executed + enriched_vetoed
-    combined.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
-
-    # Filters
     if ticker_filter:
-        combined = [r for r in combined if r.get("ticker", "") == ticker_filter]
+        raw = [r for r in raw if r.get("ticker", "") == ticker_filter]
     if date_from:
-        combined = [r for r in combined if r.get("timestamp", "") >= date_from]
+        raw = [r for r in raw if r.get("timestamp", "") >= date_from]
     if date_to:
-        combined = [r for r in combined if r.get("timestamp", "") <= date_to + "T23:59:59"]
+        raw = [r for r in raw if r.get("timestamp", "") <= date_to + "T23:59:59"]
+
+    total_matched = len(raw)
+    page = raw[:MAX_ROWS]
+
+    combined = []
+    for r in page:
+        ticker = r.get("ticker", "")
+        ts_str = r.get("timestamp", "")
+        if r["_type"] == "executed":
+            want = "buy_analysis" if str(r.get("action", "")).upper() == "BUY" else ""
+            dec = find_decision(ticker, ts_str, want)
+            row = {**dec, **r}
+            row["haiku_verdict"] = row.get("haiku_verdict") or "APPROVED"
+            # Exit-driven SELLs log under key "reason"; normalize to "reasoning"
+            # so the table/modal renders it instead of "—".
+            if not row.get("reasoning") and row.get("reason"):
+                row["reasoning"] = row["reason"]
+        else:
+            dec = find_decision(ticker, ts_str, "buy_analysis")
+            row = {**dec, **r}
+            row["action"]        = row.get("recommendation", "")
+            row["haiku_verdict"] = row.get("haiku_verdict") or "VETO"
+        combined.append(row)
 
     # Reuse already-loaded executed/vetoed instead of re-reading both files.
     all_tickers = sorted({r.get("ticker", "") for r in (executed + vetoed)})
@@ -291,6 +315,8 @@ def history():
         ticker_filter=ticker_filter,
         date_from=date_from,
         date_to=date_to,
+        total_matched=total_matched,
+        shown=len(combined),
     )
 
 
