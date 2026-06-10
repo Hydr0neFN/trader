@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -10,18 +11,44 @@ from alpaca.trading.client import TradingClient
 
 load_dotenv(Path.home() / ".env")
 
-ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
-ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
-LOG_DIR = Path.home() / "trade_logs"
+# Read credentials defensively: a missing ~/.env should surface a clear message
+# (in the route error banner) rather than a bare KeyError worker-boot crash.
+ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+# LOG_DIR override lets a hardened (non-cron-user) service still find the logs.
+LOG_DIR = Path(os.environ.get("TRADE_LOG_DIR", Path.home() / "trade_logs"))
+STARTING_EQUITY = float(os.environ.get("STARTING_EQUITY", "100000"))
 ET = ZoneInfo("America/New_York")
 
 app = Flask(__name__)
+
+# One reused client + a tiny TTL cache: account/positions only change when the
+# cron runs (every 30 min), so per-request Alpaca calls (no default timeout)
+# needlessly burn the shared rate-limit budget and can wedge a worker on a hang.
+_client: TradingClient | None = None
+_cache: dict = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_alpaca() -> TradingClient:
-    return TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    global _client
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY not set — check ~/.env")
+    if _client is None:
+        _client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    return _client
+
+
+def cached(key: str, ttl: float, fn):
+    """Return fn() memoized for `ttl` seconds (per-process)."""
+    hit = _cache.get(key)
+    now = time.monotonic()
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _cache[key] = (now, val)
+    return val
 
 
 def read_jsonl(filename: str) -> list:
@@ -80,8 +107,8 @@ def overview():
 
     try:
         client    = get_alpaca()
-        account   = client.get_account()
-        positions = client.get_all_positions()
+        account   = cached("account", 20, client.get_account)
+        positions = cached("positions", 20, client.get_all_positions)
 
         equity      = float(account.equity)
         last_eq     = float(account.last_equity)
@@ -89,8 +116,8 @@ def overview():
         cash        = float(account.cash)
         day_pnl     = equity - last_eq
         day_pnl_pct = (day_pnl / last_eq * 100) if last_eq else 0
-        total_pnl     = port_val - 100_000  # paper account starts at $100k
-        total_pnl_pct = total_pnl / 100_000 * 100
+        total_pnl     = port_val - STARTING_EQUITY  # configurable paper baseline
+        total_pnl_pct = total_pnl / STARTING_EQUITY * 100 if STARTING_EQUITY else 0
 
         account_data = {
             "portfolio_value": port_val,
@@ -125,7 +152,7 @@ def overview():
             "label": fmt_ts(h["timestamp"]),
             "value": round(h.get("portfolio_value", 0), 2),
         }
-        for h in history
+        for h in history if h.get("timestamp")   # skip schema-drifted lines
     ]
 
     return render_template(
@@ -147,7 +174,7 @@ def positions():
 
     try:
         client    = get_alpaca()
-        positions = client.get_all_positions()
+        positions = cached("positions", 20, client.get_all_positions)
 
         for p in positions:
             rows.append({
@@ -158,7 +185,9 @@ def positions():
                 "market_value": float(p.market_value),
                 "unreal_pl":    float(p.unrealized_pl),
                 "unreal_plpct": float(p.unrealized_plpc) * 100,
-                "side":         str(p.side).upper(),
+                # PositionSide is a str-Enum: str(p.side) → "PositionSide.long".
+                # Use .value so the template's r.side == 'LONG' check matches.
+                "side":         str(getattr(p.side, "value", p.side)).upper(),
             })
     except Exception as exc:
         error = str(exc)
@@ -182,32 +211,56 @@ def history():
     for d in all_decisions:
         dec_by_ticker.setdefault(d.get("ticker", ""), []).append(d)
 
-    def find_decision(ticker: str, ts_str: str) -> dict:
-        """Return the decisions record closest in time to ts_str for ticker."""
-        candidates = dec_by_ticker.get(ticker, [])
-        if not candidates or not ts_str:
-            return {}
+    def _parse_dt(s):
+        """Parse an ISO timestamp, coercing naive values to UTC. None on failure."""
         try:
-            ts = datetime.fromisoformat(ts_str)
-        except Exception:
+            dt = datetime.fromisoformat(s)
+        except (TypeError, ValueError):
+            return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+    def find_decision(ticker: str, ts_str: str, want_type: str = "") -> dict:
+        """Return the decisions record closest in time to ts_str for ticker.
+
+        Hardened: a single malformed/naive/null run_timestamp must not 500 the
+        whole page (decisions.jsonl is append-only across schema versions), and
+        a match further than one cron interval (30 min) away is rejected so the
+        modal never shows an unrelated run's reasoning. Prefers want_type.
+        """
+        ts = _parse_dt(ts_str)
+        if ts is None:
             return {}
-        return min(
-            candidates,
-            key=lambda d: abs(
-                (datetime.fromisoformat(d.get("run_timestamp", ts_str)) - ts).total_seconds()
-            ),
-        )
+        candidates = dec_by_ticker.get(ticker, [])
+        if want_type:
+            typed = [d for d in candidates if d.get("decision_type") == want_type]
+            candidates = typed or candidates
+        parsed = []
+        for d in candidates:
+            dt = _parse_dt(d.get("run_timestamp") or ts_str)
+            if dt is not None:
+                parsed.append((abs((dt - ts).total_seconds()), d))
+        if not parsed:
+            return {}
+        delta, best = min(parsed, key=lambda x: x[0])
+        if delta > 1800:   # > one 30-min cron interval: not the same run
+            return {}
+        return best
 
     enriched_executed = []
     for e in executed:
-        dec = find_decision(e.get("ticker", ""), e.get("timestamp", ""))
+        want = "buy_analysis" if str(e.get("action", "")).upper() == "BUY" else ""
+        dec = find_decision(e.get("ticker", ""), e.get("timestamp", ""), want)
         row = {**dec, **e, "_type": "executed"}
         row["haiku_verdict"] = row.get("haiku_verdict") or "APPROVED"
+        # Exit-driven SELLs are logged with key "reason"; normalize to
+        # "reasoning" so the History table/modal renders it instead of "—".
+        if not row.get("reasoning") and row.get("reason"):
+            row["reasoning"] = row["reason"]
         enriched_executed.append(row)
 
     enriched_vetoed = []
     for v in vetoed:
-        dec = find_decision(v.get("ticker", ""), v.get("timestamp", ""))
+        dec = find_decision(v.get("ticker", ""), v.get("timestamp", ""), "buy_analysis")
         row = {**dec, **v, "_type": "vetoed"}
         row["action"]        = row.get("recommendation", "")
         row["haiku_verdict"] = row.get("haiku_verdict") or "VETO"
@@ -224,9 +277,8 @@ def history():
     if date_to:
         combined = [r for r in combined if r.get("timestamp", "") <= date_to + "T23:59:59"]
 
-    all_tickers = sorted(
-        {r.get("ticker", "") for r in (read_jsonl("executed.jsonl") + read_jsonl("vetoed.jsonl"))}
-    )
+    # Reuse already-loaded executed/vetoed instead of re-reading both files.
+    all_tickers = sorted({r.get("ticker", "") for r in (executed + vetoed)})
 
     def row_json(r: dict) -> str:
         return json.dumps({k: v for k, v in r.items() if k != "_type"}, default=str)

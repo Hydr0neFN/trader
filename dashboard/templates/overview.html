@@ -28,7 +28,7 @@
     <div class="card stat-card h-100">
       <div class="card-body">
         <div class="stat-label">Day P&amp;L</div>
-        <div class="stat-value {% if account.day_pnl and account.day_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
+        <div class="stat-value {% if account.day_pnl is defined and account.day_pnl is not none and account.day_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
           {{ account.day_pnl | fmt_currency }}
           <small style="font-size:.9rem;">({{ account.day_pnl_pct | fmt_pct }})</small>
         </div>
@@ -39,7 +39,7 @@
     <div class="card stat-card h-100">
       <div class="card-body">
         <div class="stat-label">Total P&amp;L</div>
-        <div class="stat-value {% if account.total_pnl and account.total_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
+        <div class="stat-value {% if account.total_pnl is defined and account.total_pnl is not none and account.total_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
           {{ account.total_pnl | fmt_currency }}
           <small style="font-size:.9rem;">({{ account.total_pnl_pct | fmt_pct }})</small>
         </div>
@@ -64,7 +64,7 @@
     <div class="card stat-card h-100">
       <div class="card-body">
         <div class="stat-label">Net P&amp;L <span style="font-size:.7rem;color:#8b949e;">(after sim fees)</span></div>
-        <div class="stat-value {% if net_pnl and net_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
+        <div class="stat-value {% if net_pnl is defined and net_pnl is not none and net_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
           {{ net_pnl | fmt_currency }}
         </div>
       </div>

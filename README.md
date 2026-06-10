@@ -1,8 +1,8 @@
 # trader
 
 Multi-LLM algorithmic **paper-trading** system for US equities. Runs on a cron
-schedule during market hours, analyzes the top 50 S&P 500 names with an ensemble
-of language models, and places paper orders through Alpaca.
+schedule during market hours, analyzes ~50 large-cap S&P 500 names with an
+ensemble of language models, and places paper orders through Alpaca.
 
 > **Paper-only.** All trading uses Alpaca's paper endpoint (`paper=True`). No real
 > money is at risk. No profitability is claimed — this is a research scaffold.

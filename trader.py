@@ -14,6 +14,7 @@ if the market is closed (including holidays via Alpaca's clock endpoint).
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -46,9 +47,12 @@ HF_API_TOKEN      = os.environ["HF_API_TOKEN"]
 # Raised to 5% to give the AI exit analysis room to work.
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "5"))
 
-# Top 50 S&P 500 by market cap
+# Top S&P 500 by market cap.
+# NOTE: BRK-B was removed — yfinance uses "BRK-B" but Alpaca's trading/news API
+# uses "BRK.B", so that name could never fetch news or fill an order (it only
+# polluted the logs). Re-add via a per-API symbol map if you want it back.
 TICKERS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "AVGO", "LLY",
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "LLY",
     "JPM", "TSLA", "WMT", "V", "MA", "UNH", "XOM", "COST", "JNJ", "HD", "PG",
     "ABBV", "NFLX", "BAC", "CRM", "AMD", "KO", "CVX", "MRK", "PEP", "TMO",
     "ORCL", "ACN", "LIN", "CSCO", "ADBE", "MCD", "WFC", "ABT", "IBM", "PM",
@@ -115,14 +119,35 @@ def retry(fn, retries: int = 2, delay: float = 3.0):
             time.sleep(delay)
 
 
+def safe_int(value, default: int = 0) -> int:
+    """Coerce LLM-supplied numbers to int without crashing the run.
+
+    Handles "85", "85.5", "high", None, etc. — int(float(...)) also accepts
+    decimal strings; anything non-numeric falls back to `default`.
+    """
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def strip_json_fences(text: str) -> str:
+    """Extract a JSON body from an LLM reply, tolerant of fence variants and prose.
+
+    Handles: ```json / ``` json / ```JSON, a fence anywhere (preamble before it),
+    and bare replies. Falls back to slicing from the first {/[ to the last }/].
+    """
     text = text.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        inner = parts[1] if len(parts) > 1 else text
-        if inner.startswith("json"):
-            inner = inner[4:]
-        return inner.strip()
+    m = re.search(r"```(?:\s*json)?\s*(.*?)```", text, re.S | re.I)
+    if m:
+        return m.group(1).strip()
+    # No fence — slice the outermost JSON span if there is surrounding prose.
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    ends   = [i for i in (text.rfind("}"), text.rfind("]")) if i != -1]
+    if starts and ends:
+        lo, hi = min(starts), max(ends)
+        if hi > lo:
+            return text[lo:hi + 1].strip()
     return text
 
 
@@ -187,7 +212,7 @@ def find_original_buy_reasoning(ticker: str) -> str:
         try:
             rec = json.loads(line)
             if (rec.get("ticker") == ticker
-                    and "BUY" in rec.get("final_action", "").upper()
+                    and rec.get("final_action", "").upper() == "BUY_EXECUTED"
                     and rec.get("run_timestamp", "") > best_ts):
                 best_ts = rec["run_timestamp"]
                 best_reasoning = rec.get("gemini_reasoning", "")
@@ -206,18 +231,25 @@ def is_market_open(client: TradingClient) -> bool:
     if not (dtime(9, 30) <= n.time() < dtime(16, 0)):
         return False
     try:
-        clock = client.get_clock()
+        clock = retry(lambda: client.get_clock(), retries=1, delay=2.0)
         return clock.is_open
     except Exception as exc:
-        log.warning("Alpaca clock check failed (%s); falling back to local time check.", exc)
-        return True
+        # Fail CLOSED: the Alpaca clock is the only holiday/early-close gate, so
+        # a transient error must not let the run trade on a holiday with stale
+        # data. Skipping one 30-min cycle is cheap; if Alpaca is truly down,
+        # order submission would fail anyway.
+        log.warning("Alpaca clock check failed (%s); skipping this cycle to be safe.", exc)
+        return False
 
 
 # ── Step 1: Data Ingestion ────────────────────────────────────────────────────
 
 def fetch_market_data(ticker: str) -> dict:
     t = yf.Ticker(ticker)
-    hist = t.history(period="60d")
+    # 6 months of daily bars (~126 sessions) so MA50 averages a true 50-bar
+    # window. period="60d" returned only ~41 trading bars, so the prior "MA50"
+    # was actually MA~41 and mislabeled in the prompt fed to the LLMs.
+    hist = t.history(period="6mo")
     if hist.empty or len(hist) < 2:
         raise ValueError(f"Insufficient price history for {ticker}")
 
@@ -355,7 +387,7 @@ SENTIMENT_SYSTEM = (
 # Tried in order — falls back if a model is overloaded or unavailable.
 HF_SENTIMENT_MODELS = [
     "deepseek-ai/DeepSeek-V3.2-Exp",
-    "Qwen/Qwen3-8B-Instruct",
+    "Qwen/Qwen3-8B",   # Qwen3 merged instruct into the base repo; -Instruct 404s
     "meta-llama/Llama-3.3-70B-Instruct",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",  # last resort
 ]
@@ -526,7 +558,7 @@ def call_gemini_cli(system_prompt: str, user_prompt: str, model):
     for m in chain:
         try:
             proc = subprocess.run(
-                [GEMINI_CLI_PATH, "-m", m, "-o", "json", "-y", "-p", full_prompt],
+                [GEMINI_CLI_PATH, "-m", m, "-o", "json", "--approval-mode", "plan", "-p", full_prompt],
                 capture_output=True,
                 text=True,
                 timeout=GEMINI_CLI_TIMEOUT,
@@ -684,7 +716,11 @@ def calc_sim_fees(action: str, qty: int, price: float) -> dict:
     }
 
 
-def execute_trades(approved: list, data_map: dict, client: TradingClient) -> None:
+def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dict:
+    """Submit approved orders. Returns {ticker: status} so the caller can label
+    decisions.jsonl with what actually happened (EXECUTED vs a SKIP reason vs
+    ORDER_FAILED) instead of blanket-stamping every approved rec as _EXECUTED.
+    """
     account       = client.get_account()
     portfolio_val = float(account.portfolio_value)
     max_trade_val = portfolio_val * MAX_POSITION_PCT
@@ -692,6 +728,9 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> Non
     positions  = {p.symbol: p for p in client.get_all_positions()}
     open_count = len(positions)
     ts         = now_et().isoformat()
+
+    status: dict = {}
+    bought: set = set()   # guards against duplicate analyst recs double-buying
 
     for rec in approved:
         ticker = rec["ticker"]
@@ -701,12 +740,19 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> Non
         if action == "BUY":
             if open_count >= MAX_POSITIONS:
                 log.info("SKIP %s BUY: max open positions (%d) reached", ticker, MAX_POSITIONS)
+                status[ticker] = "SKIPPED_MAX_POS"
                 continue
-            if ticker in positions:
-                log.info("SKIP %s BUY: position already open", ticker)
+            if ticker in positions or ticker in bought:
+                log.info("SKIP %s BUY: position already open / already bought this run", ticker)
+                status[ticker] = "SKIPPED_OPEN"
                 continue
 
-            qty = max(1, int(max_trade_val / price))
+            qty = int(max_trade_val / price)
+            if qty < 1:
+                log.info("SKIP %s BUY: one share ($%.2f) exceeds position budget ($%.2f)",
+                         ticker, price, max_trade_val)
+                status[ticker] = "SKIPPED_BUDGET"
+                continue
             try:
                 order = client.submit_order(MarketOrderRequest(
                     symbol=ticker,
@@ -729,12 +775,16 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> Non
                 log.info("BUY  %dx %s @ ~$%.2f | sim_fee=$%.4f | order %s",
                          qty, ticker, price, fees["sim_total_fee"], order.id)
                 open_count += 1
+                bought.add(ticker)
+                status[ticker] = "EXECUTED"
             except Exception as exc:
                 log.error("BUY order failed for %s: %s", ticker, exc)
+                status[ticker] = "ORDER_FAILED"
 
         elif action == "SELL":
             if ticker not in positions:
                 log.info("SKIP %s SELL: no position held", ticker)
+                status[ticker] = "SKIPPED_NO_POS"
                 continue
 
             held_qty = int(float(positions[ticker].qty))
@@ -760,8 +810,12 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> Non
                 log.info("SELL %dx %s @ ~$%.2f | sim_fee=$%.4f | order %s",
                          held_qty, ticker, price, fees["sim_total_fee"], order.id)
                 open_count -= 1
+                status[ticker] = "EXECUTED"
             except Exception as exc:
                 log.error("SELL order failed for %s: %s", ticker, exc)
+                status[ticker] = "ORDER_FAILED"
+
+    return status
 
 
 # ── Portfolio Snapshot (for dashboard chart) ──────────────────────────────────
@@ -875,6 +929,7 @@ def run_ai_exits(
     headlines_map: dict,
     run_ts: str,
     api_calls: dict,
+    hard_stopped: set | None = None,
 ) -> tuple:
     """Run Gemini + Haiku exit analysis for all open positions not already stopped out.
 
@@ -893,9 +948,16 @@ def run_ai_exits(
 
     sold_tickers:   list = []
     exit_decisions: list = []
+    hard_stopped = hard_stopped or set()
 
     for p in positions:
         ticker    = p.symbol
+        # Skip names already hard-stopped this run: their stop SELL may still be
+        # unfilled (halt/open volatility), so a second AI-driven SELL here would
+        # double-sell — rejected at best, an unintended short at worst.
+        if ticker in hard_stopped:
+            log.info("  %-6s skipping AI exit — already hard-stopped this run", ticker)
+            continue
         current   = float(p.current_price)
         avg_entry = float(p.avg_entry_price)
         plpc      = float(p.unrealized_plpc) * 100
@@ -1029,6 +1091,19 @@ def run_ai_exits(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Single-instance lock: a slow run (CLI timeouts, retry sleeps, 50-ticker
+    # ingestion) can exceed the 30-min cron interval. Two overlapping instances
+    # would each see "no position" for a ticker and both BUY (2x size), and
+    # interleave jsonl writes. flock guarantees only one runs at a time.
+    # Imported lazily so the module still parses on non-Linux dev machines.
+    import fcntl
+    _lock_fh = open(LOG_DIR / "trader.lock", "w")
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.warning("Another trader run is still in progress — exiting to avoid overlap.")
+        sys.exit(0)
+
     alpaca = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
     if not is_market_open(alpaca):
@@ -1062,13 +1137,21 @@ def main() -> None:
 
     for ticker in TICKERS:
         try:
-            mdata     = retry(lambda t=ticker: fetch_market_data(t))
-            headlines = retry(lambda t=ticker: fetch_news(t, rate_limit_sleep=1.0))
-            data_map[ticker]      = mdata
-            headlines_map[ticker] = headlines
-            log.info("  %-6s $%.2f  (%+.2f%%)", ticker, mdata["current_price"], mdata["daily_change_pct"])
+            mdata = retry(lambda t=ticker: fetch_market_data(t))
         except Exception as exc:
-            log.warning("  Skipping %s — ingestion failed: %s", ticker, exc)
+            log.warning("  Skipping %s — market data failed: %s", ticker, exc)
+            continue
+        # Headlines are optional (build_data_block handles []). A news-API
+        # outage must NOT drop a ticker whose prices fetched fine, nor abort
+        # the whole run — degrade to technicals-only analysis instead.
+        try:
+            headlines = retry(lambda t=ticker: fetch_news(t, rate_limit_sleep=1.0))
+        except Exception as exc:
+            log.warning("  %-6s news fetch failed (%s) — proceeding technicals-only", ticker, exc)
+            headlines = []
+        data_map[ticker]      = mdata
+        headlines_map[ticker] = headlines
+        log.info("  %-6s $%.2f  (%+.2f%%)", ticker, mdata["current_price"], mdata["daily_change_pct"])
 
     if not data_map:
         log.error("No market data retrieved. Aborting run.")
@@ -1086,7 +1169,7 @@ def main() -> None:
     # ── Step 0b: AI exit analysis for positions not already stopped ──────
     log.info("Step 0b: AI exit analysis for open positions…")
     ai_exited, exit_decisions = run_ai_exits(
-        alpaca, data_map, headlines_map, run_ts, api_calls
+        alpaca, data_map, headlines_map, run_ts, api_calls, set(hard_stopped)
     )
     if ai_exited:
         log.info("  AI-exited/trimmed %d position(s): %s", len(ai_exited), ", ".join(ai_exited))
@@ -1113,10 +1196,10 @@ def main() -> None:
 
         log.info("  %s — calling Gemini…", batch_label)
         try:
-            batch_recs, model = retry(
-                lambda bl=batch_blocks, lb=batch_label: run_analyst(bl, lb),
-                retries=1, delay=5.0,
-            )
+            # run_analyst already walks the full model-priority chain (each
+            # model retried once), so an outer retry here just doubled every
+            # attempt — up to 28 calls + minutes of sleep per batch on outage.
+            batch_recs, model = run_analyst(batch_blocks, batch_label)
             analyst_recs.extend(batch_recs)
             gemini_model_used = model       # last-used model (usually consistent)
             api_calls["gemini"] += 1
@@ -1157,8 +1240,14 @@ def main() -> None:
 
     for rec in analyst_recs:
         ticker            = rec.get("ticker", "")
-        action            = rec.get("recommendation", "HOLD")
-        gemini_confidence = int(rec.get("confidence") or 0)
+        # Normalize the analyst verdict: a variant like "Buy"/"strong buy"
+        # would otherwise be != "HOLD", burn HF+Haiku calls, then match no
+        # execution branch while still being stamped "<x>_EXECUTED".
+        action = str(rec.get("recommendation", "HOLD")).strip().upper()
+        if action not in ("BUY", "SELL", "HOLD"):
+            action = "HOLD"
+        rec["recommendation"] = action
+        gemini_confidence = safe_int(rec.get("confidence"))
 
         # ── HOLDs: skip HF + Haiku entirely ──────────────────────────────
         if action == "HOLD":
@@ -1200,10 +1289,14 @@ def main() -> None:
         # 3b-pre. Auto-veto: hallucinated news
         has_headlines          = bool(headlines_map.get(ticker, []))
         gemini_reasoning_lower = rec.get("reasoning", "").lower()
+        # The prompt instructs the analyst to state "No news data available"
+        # when no headlines exist; if it did, it is correctly declaring absence
+        # (not hallucinating), so generic price-movement verbs must not auto-veto.
+        declared_no_news = "no news data available" in gemini_reasoning_lower
         analyst_referenced_news = any(
             kw in gemini_reasoning_lower for kw in NEWS_REFERENCE_KEYWORDS
         )
-        if not has_headlines and analyst_referenced_news:
+        if not has_headlines and analyst_referenced_news and not declared_no_news:
             auto_veto_reason = (
                 "AUTO-VETO: analyst referenced news not present in data — "
                 "no headlines were fetched for this ticker this cycle"
@@ -1302,11 +1395,19 @@ def main() -> None:
     log.info("Step 4: Executing %d approved trade(s)…", len(approved_trades))
     if approved_trades:
         try:
-            execute_trades(approved_trades, data_map, alpaca)
+            exec_status = execute_trades(approved_trades, data_map, alpaca)
             for rec in approved_trades:
                 t = rec.get("ticker", "")
-                if t in decisions:
+                if t not in decisions:
+                    continue
+                st = exec_status.get(t, "ORDER_FAILED")
+                if st == "EXECUTED":
                     decisions[t]["final_action"] = f"{rec.get('recommendation')}_EXECUTED"
+                else:
+                    # SKIPPED_* / ORDER_FAILED — do not claim an execution that
+                    # never happened (find_original_buy_reasoning keys on
+                    # BUY_EXECUTED, so a false claim would mis-feed the exit analyst).
+                    decisions[t]["final_action"] = st
         except Exception as exc:
             log.error("Trade execution error: %s", exc)
     else:
