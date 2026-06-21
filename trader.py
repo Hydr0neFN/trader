@@ -466,6 +466,20 @@ _SONNET_IN_USD, _SONNET_OUT_USD = 3e-6, 15e-6
 _sdk_state = {"fails": 0, "off": False}
 _SDK_MAX_FAILS = 3
 
+# Which Claude calls may use Sonnet-via-SDK: all | exits | none.
+# Default 'exits' = Option 1: Sonnet for the high-value (low-volume) exit gate,
+# Haiku for the high-volume buy screen, keeping the shared $20 pool comfortable.
+# Set CLAUDE_SDK_FOR=all to put Sonnet on buy reviews too (until the cap trips).
+CLAUDE_SDK_FOR = os.environ.get("CLAUDE_SDK_FOR", "exits").lower()
+
+
+def _sdk_allowed_for(call_type: str) -> bool:
+    if CLAUDE_SDK_FOR == "all":
+        return True
+    if CLAUDE_SDK_FOR == "none":
+        return False
+    return call_type == "exit"
+
 
 def _sdk_month() -> str:
     return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m")
@@ -550,14 +564,16 @@ def _claude_via_api(system: str, user: str, max_tokens: int) -> str:
     return msg.content[0].text.strip()
 
 
-def claude_complete(system: str, user: str, max_tokens: int, label: str = "") -> tuple:
+def claude_complete(system: str, user: str, max_tokens: int, label: str = "",
+                    call_type: str = "exit") -> tuple:
     """Unified Claude call: Sonnet via SDK (subscription) → Haiku via API.
 
+    call_type ('buy' | 'exit') + CLAUDE_SDK_FOR decide whether Sonnet is tried.
     Returns (text, path) where path is 'sonnet-sdk' or 'haiku-api'. SDK problems
     never raise (always fall back to the API); the API path may still raise and
     is handled by the caller's retry().
     """
-    if _claude_use_sdk():
+    if _sdk_allowed_for(call_type) and _claude_use_sdk():
         try:
             text, cost = _claude_via_sdk(system, user)
             _sdk_credit_add(cost)
@@ -604,7 +620,7 @@ def run_risk_manager(data_block: str, analyst_rec: dict, hf_sentiment: dict) -> 
     )
 
     def call():
-        raw, path = claude_complete(RISK_SYSTEM, user_msg, max_tokens=150, label=ticker)
+        raw, path = claude_complete(RISK_SYSTEM, user_msg, max_tokens=150, label=ticker, call_type="buy")
         log.debug("Risk raw (%s) for %s: %s", path, ticker, raw[:300])
         try:
             data = json.loads(strip_json_fences(raw))
@@ -806,7 +822,7 @@ def run_exit_risk_manager(position_context: str, exit_rec: dict) -> tuple:
     )
 
     def call():
-        raw, path = claude_complete(EXIT_RISK_SYSTEM, user_msg, max_tokens=100, label=ticker)
+        raw, path = claude_complete(EXIT_RISK_SYSTEM, user_msg, max_tokens=100, label=ticker, call_type="exit")
         log.debug("Exit risk raw (%s) for %s: %s", path, ticker, raw[:300])
         try:
             data = json.loads(strip_json_fences(raw))
