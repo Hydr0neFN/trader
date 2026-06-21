@@ -432,6 +432,148 @@ def run_sentiment_analyst(data_block: str) -> dict:
     return {"sentiment": "NEUTRAL", "confidence": 0, "reasoning": "HF agent unavailable", "model": "none"}
 
 
+# ── Claude router: Sonnet via SDK (subscription) → Haiku via API fallback ─────
+#
+# Primary path runs Claude **Sonnet** through the Claude Agent SDK / `claude`
+# CLI, authenticated by a Pro-subscription OAuth token
+# (CLAUDE_CODE_OAUTH_TOKEN, produced once via `claude setup-token`). This draws
+# on the subscription's included usage instead of metered API tokens.
+#
+# Fallback path is the original metered Anthropic API on **Haiku**. It is used
+# whenever: the SDK is disabled, no OAuth token is present, the shared monthly
+# credit cap is reached, or any SDK call errors. With no token configured the
+# bot behaves exactly as before (Haiku-only), so this is safe to deploy before
+# the subscription login is completed.
+#
+# The monthly-spend ledger is SHARED with the other bot (DOWTrade) via one file
+# so both draw down the same ~$20 subscription pool — see CLAUDE_SDK_CREDIT_FILE.
+
+CLAUDE_SDK_ENABLED = os.environ.get("CLAUDE_SDK_ENABLED", "1").lower() in ("1", "true", "yes")
+CLAUDE_OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+CLAUDE_SDK_MODEL   = os.environ.get("CLAUDE_SDK_MODEL", "sonnet")
+CLAUDE_API_MODEL   = os.environ.get("CLAUDE_API_MODEL", "claude-haiku-4-5-20251001")
+CLAUDE_CLI_PATH    = os.environ.get("CLAUDE_CLI_PATH", "claude")
+CLAUDE_SDK_TIMEOUT = int(os.environ.get("CLAUDE_SDK_TIMEOUT", "120"))
+CLAUDE_SDK_CAP_USD = float(os.environ.get("CLAUDE_SDK_MONTHLY_CAP_USD", "20"))
+CLAUDE_CREDIT_FILE = Path(os.environ.get(
+    "CLAUDE_SDK_CREDIT_FILE", str(Path.home() / ".claude_sdk_credit.json")))
+
+# Sonnet 4.x list pricing (USD/token) — used to value subscription usage against
+# the monthly cap when the CLI reports total_cost_usd == 0 (subscription mode).
+_SONNET_IN_USD, _SONNET_OUT_USD = 3e-6, 15e-6
+# In-process circuit breaker: after N consecutive SDK failures in a single run,
+# stop trying the SDK and serve the remainder of the run from the API.
+_sdk_state = {"fails": 0, "off": False}
+_SDK_MAX_FAILS = 3
+
+
+def _sdk_month() -> str:
+    return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m")
+
+
+def _sdk_credit_spent() -> float:
+    try:
+        return float(json.loads(CLAUDE_CREDIT_FILE.read_text()).get(_sdk_month(), 0.0))
+    except Exception:
+        return 0.0
+
+
+def _sdk_credit_add(cost_usd: float) -> None:
+    month = _sdk_month()
+    try:
+        ledger = json.loads(CLAUDE_CREDIT_FILE.read_text())
+    except Exception:
+        ledger = {}
+    ledger[month] = round(float(ledger.get(month, 0.0)) + max(0.0, cost_usd), 6)
+    try:  # atomic write so the concurrent (DOWTrade) writer can't read half a file
+        tmp = CLAUDE_CREDIT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(ledger))
+        os.replace(tmp, CLAUDE_CREDIT_FILE)
+    except Exception as exc:
+        log.warning("Could not persist SDK credit ledger: %s", exc)
+
+
+def _claude_use_sdk() -> bool:
+    return (
+        CLAUDE_SDK_ENABLED
+        and bool(CLAUDE_OAUTH_TOKEN)
+        and not _sdk_state["off"]
+        and _sdk_credit_spent() < CLAUDE_SDK_CAP_USD
+    )
+
+
+def _claude_via_sdk(system: str, user: str) -> tuple:
+    """One-shot Claude Sonnet call via the `claude` CLI (subscription auth).
+
+    Runs from /tmp with ANTHROPIC_API_KEY stripped so the CLI uses the OAuth
+    subscription token (the $20 credit) rather than metered API billing.
+    Returns (text, cost_usd); raises on any error so the caller can fall back.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = CLAUDE_OAUTH_TOKEN
+    proc = subprocess.run(
+        [CLAUDE_CLI_PATH, "-p", user,
+         "--model", CLAUDE_SDK_MODEL,
+         "--system-prompt", system,
+         "--output-format", "json",
+         "--max-turns", "1",
+         "--allowedTools", "",
+         "--no-session-persistence",
+         "--permission-mode", "default"],
+        capture_output=True, text=True, timeout=CLAUDE_SDK_TIMEOUT, cwd="/tmp", env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude exit {proc.returncode}: {proc.stderr[-200:]}")
+    payload = json.loads(proc.stdout)
+    if payload.get("is_error") or payload.get("subtype") != "success":
+        raise RuntimeError(f"claude error: {str(payload.get('result'))[:200]}")
+    text = (payload.get("result") or "").strip()
+    if not text:
+        raise RuntimeError("claude empty result")
+    cost = float(payload.get("total_cost_usd") or 0.0)
+    if cost <= 0:  # subscription mode often reports 0 — value it via token usage
+        u = payload.get("usage", {}) or {}
+        cost = ((u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)) * _SONNET_IN_USD
+                + u.get("output_tokens", 0) * _SONNET_OUT_USD)
+    return text, cost
+
+
+def _claude_via_api(system: str, user: str, max_tokens: int) -> str:
+    """Metered Anthropic API call on Haiku (fallback path)."""
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(
+        model=CLAUDE_API_MODEL,
+        max_tokens=max_tokens,
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user}],
+    )
+    return msg.content[0].text.strip()
+
+
+def claude_complete(system: str, user: str, max_tokens: int, label: str = "") -> tuple:
+    """Unified Claude call: Sonnet via SDK (subscription) → Haiku via API.
+
+    Returns (text, path) where path is 'sonnet-sdk' or 'haiku-api'. SDK problems
+    never raise (always fall back to the API); the API path may still raise and
+    is handled by the caller's retry().
+    """
+    if _claude_use_sdk():
+        try:
+            text, cost = _claude_via_sdk(system, user)
+            _sdk_credit_add(cost)
+            _sdk_state["fails"] = 0
+            return text, "sonnet-sdk"
+        except Exception as exc:
+            _sdk_state["fails"] += 1
+            log.warning("%sClaude SDK failed (%s) — falling back to Haiku API",
+                        f"[{label}] " if label else "", str(exc)[:160])
+            if _sdk_state["fails"] >= _SDK_MAX_FAILS:
+                _sdk_state["off"] = True
+                log.warning("Claude SDK disabled for the rest of this run after %d failures",
+                            _SDK_MAX_FAILS)
+    return _claude_via_api(system, user, max_tokens), "haiku-api"
+
+
 # ── Step 3: Risk Manager — Claude Haiku ──────────────────────────────────────
 
 RISK_SYSTEM = (
@@ -450,7 +592,6 @@ RISK_SYSTEM = (
 
 
 def run_risk_manager(data_block: str, analyst_rec: dict, hf_sentiment: dict) -> tuple:
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
     ticker = analyst_rec.get("ticker", "?")
 
     user_msg = (
@@ -463,14 +604,8 @@ def run_risk_manager(data_block: str, analyst_rec: dict, hf_sentiment: dict) -> 
     )
 
     def call():
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=150,
-            system=RISK_SYSTEM,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        raw = msg.content[0].text.strip()
-        log.debug("Haiku raw response for %s: %s", ticker, raw[:300])
+        raw, path = claude_complete(RISK_SYSTEM, user_msg, max_tokens=150, label=ticker)
+        log.debug("Risk raw (%s) for %s: %s", path, ticker, raw[:300])
         try:
             data = json.loads(strip_json_fences(raw))
         except json.JSONDecodeError as parse_err:
@@ -536,6 +671,10 @@ GEMINI_CLI_EXIT_MODELS = [
 ]
 GEMINI_CLI_EXIT_MODEL = GEMINI_CLI_EXIT_MODELS[0]  # legacy alias (head of chain)
 GEMINI_CLI_TIMEOUT    = int(os.environ.get("GEMINI_CLI_TIMEOUT", "60"))
+# Google retired the Gemini CLI for individual (free/Pro) tiers on 2026-06-18;
+# it now returns IneligibleTierError. The exit analyst therefore uses the Gemini
+# **API** by default. Set USE_GEMINI_EXIT_CLI=1 only with a paid-key-backed CLI.
+USE_GEMINI_EXIT_CLI   = os.environ.get("USE_GEMINI_EXIT_CLI", "0").lower() in ("1", "true", "yes")
 
 
 def call_gemini_cli(system_prompt: str, user_prompt: str, model):
@@ -583,33 +722,36 @@ def call_gemini_cli(system_prompt: str, user_prompt: str, model):
 def run_exit_analyst(position_context: str, batch_label: str = "") -> dict:
     """Call Gemini to decide HOLD / TRIM / EXIT for one position.
 
-    Primary path: gemini CLI with Gemini 3.1 Pro (via signed-in Pro plan).
-    Fallback path: Gemini API with the GEMINI_MODEL_PRIORITY chain.
+    Primary path: Gemini API with the GEMINI_MODEL_PRIORITY chain.
+    Optional path: gemini CLI (USE_GEMINI_EXIT_CLI=1) — off by default because
+    Google retired the CLI for individual tiers on 2026-06-18.
 
     position_context is the full text block (position stats + market data + buy reasoning).
     Returns dict with action, confidence, reasoning, model.
     """
     pfx = f"[{batch_label}] " if batch_label else ""
 
-    # ── Primary: gemini CLI fallback chain (Pro → Flash, separate quotas) ──
-    try:
-        raw, used_model = call_gemini_cli(EXIT_ANALYST_SYSTEM, position_context, GEMINI_CLI_EXIT_MODELS)
-        data = json.loads(strip_json_fences(raw))
-        action = data.get("action", "HOLD").upper()
-        if action not in ("HOLD", "TRIM", "EXIT"):
-            action = "HOLD"
-        log.info("%sExit analyst using CLI model: %s", pfx, used_model)
-        return {
-            "action":     action,
-            "confidence": int(data.get("confidence", 0)),
-            "reasoning":  data.get("reasoning", ""),
-            "model":      f"cli:{used_model}",
-        }
-    except Exception as exc:
-        log.warning("%sCLI exit analyst failed (%s) — falling back to API…",
-                    pfx, str(exc)[:120])
+    # ── Optional CLI path (off by default; see USE_GEMINI_EXIT_CLI). The Gemini
+    #    API chain below is the primary path. ──
+    if USE_GEMINI_EXIT_CLI:
+        try:
+            raw, used_model = call_gemini_cli(EXIT_ANALYST_SYSTEM, position_context, GEMINI_CLI_EXIT_MODELS)
+            data = json.loads(strip_json_fences(raw))
+            action = data.get("action", "HOLD").upper()
+            if action not in ("HOLD", "TRIM", "EXIT"):
+                action = "HOLD"
+            log.info("%sExit analyst using CLI model: %s", pfx, used_model)
+            return {
+                "action":     action,
+                "confidence": int(data.get("confidence", 0)),
+                "reasoning":  data.get("reasoning", ""),
+                "model":      f"cli:{used_model}",
+            }
+        except Exception as exc:
+            log.warning("%sCLI exit analyst failed (%s) — falling back to API…",
+                        pfx, str(exc)[:120])
 
-    # ── Fallback: Gemini API priority chain ──
+    # ── Primary: Gemini API priority chain ──
     client  = genai.Client(api_key=GEMINI_API_KEY)
     last_exc = None
 
@@ -653,7 +795,6 @@ def run_exit_risk_manager(position_context: str, exit_rec: dict) -> tuple:
 
     Returns (verdict, justification) where verdict is APPROVED or VETO.
     """
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
     ticker = exit_rec.get("ticker", "?")
 
     user_msg = (
@@ -665,14 +806,8 @@ def run_exit_risk_manager(position_context: str, exit_rec: dict) -> tuple:
     )
 
     def call():
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=100,
-            system=EXIT_RISK_SYSTEM,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        raw = msg.content[0].text.strip()
-        log.debug("Exit Haiku raw for %s: %s", ticker, raw[:300])
+        raw, path = claude_complete(EXIT_RISK_SYSTEM, user_msg, max_tokens=100, label=ticker)
+        log.debug("Exit risk raw (%s) for %s: %s", path, ticker, raw[:300])
         try:
             data = json.loads(strip_json_fences(raw))
         except json.JSONDecodeError as parse_err:
