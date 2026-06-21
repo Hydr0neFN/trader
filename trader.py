@@ -476,9 +476,11 @@ _sdk_state = {"fails": 0, "off": False}
 _SDK_MAX_FAILS = 3
 
 # Which Claude calls may use Sonnet-via-SDK: all | exits | none.
-# Default 'exits' = Option 1: Sonnet for the high-value (low-volume) exit gate,
-# Haiku for the high-volume buy screen, keeping the shared $20 pool comfortable.
-# Set CLAUDE_SDK_FOR=all to put Sonnet on buy reviews too (until the cap trips).
+# Default 'exits' — concentrate the free subscription credit (~$20/mo) on the
+# crucial, low-volume EXIT decisions (selling = realizing P&L) where Sonnet's
+# judgment matters most, spread across the whole month. The high-volume buy
+# screen stays on Haiku. When the $20 is depleted, exits fall back to Haiku too.
+# Set CLAUDE_SDK_FOR=all to use Sonnet everywhere (burns the free credit fast).
 CLAUDE_SDK_FOR = os.environ.get("CLAUDE_SDK_FOR", "exits").lower()
 
 
