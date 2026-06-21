@@ -461,6 +461,15 @@ CLAUDE_CREDIT_FILE = Path(os.environ.get(
 # Sonnet 4.x list pricing (USD/token) — used to value subscription usage against
 # the monthly cap when the CLI reports total_cost_usd == 0 (subscription mode).
 _SONNET_IN_USD, _SONNET_OUT_USD = 3e-6, 15e-6
+# Prepended to every SDK system prompt. The `claude` CLI is an agentic harness,
+# not a raw API: without this it adds conversational preamble or refuses to
+# "rubber-stamp" trades, which breaks JSON parsing and defaults the gate to VETO.
+_SDK_HARDENING = (
+    "You are a deterministic JSON-only function inside an automated pipeline, "
+    "not an interactive assistant. You have no tools and take no actions; you only "
+    "classify the data provided. Never refuse, never add preamble or commentary, "
+    "never mention being an AI. Output exactly one JSON object and nothing else.\n\n"
+)
 # In-process circuit breaker: after N consecutive SDK failures in a single run,
 # stop trying the SDK and serve the remainder of the run from the API.
 _sdk_state = {"fails": 0, "off": False}
@@ -528,10 +537,11 @@ def _claude_via_sdk(system: str, user: str) -> tuple:
     proc = subprocess.run(
         [CLAUDE_CLI_PATH, "-p", user,
          "--model", CLAUDE_SDK_MODEL,
-         "--system-prompt", system,
+         "--system-prompt", _SDK_HARDENING + system,
          "--output-format", "json",
          "--max-turns", "1",
          "--allowedTools", "",
+         "--strict-mcp-config",
          "--no-session-persistence",
          "--permission-mode", "default"],
         capture_output=True, text=True, timeout=CLAUDE_SDK_TIMEOUT, cwd="/tmp", env=env,
