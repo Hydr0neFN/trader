@@ -16,11 +16,16 @@ Each run (every 30 min, 9:30–16:00 ET, weekdays) executes a pipeline per ticke
    Walks a model-priority chain (`gemini-3.5-flash` → `gemini-3.1-pro` → … →
    `gemini-2.5-flash`) so it degrades gracefully when a model is quota-gated.
 3. **Sentiment** (Hugging Face) — BULLISH/BEARISH/NEUTRAL second opinion.
-4. **Risk** (Anthropic Claude) — final gate; sizes positions and vetoes unsafe trades.
+4. **Risk** (Claude) — final gate; vetoes unsafe trades. Uses **Sonnet** via the
+   Claude Agent SDK (free subscription credit) for the crucial exit decisions and
+   the **Haiku** API for the high-volume buy screen; falls back to Haiku whenever
+   the credit is depleted or no subscription token is configured.
 5. **Execution** — Alpaca paper order; hard stop-loss floor enforced independently
    of the LLMs.
-6. **Exit analysis** — open positions are re-evaluated by a separate exit analyst
-   (Gemini, with `gemini-cli` fallback) + exit-risk model.
+6. **Exit analysis** — open positions are re-evaluated by a separate Gemini **API**
+   exit analyst + a Claude exit-risk gate. (Google retired the individual-tier
+   `gemini-cli` on 2026-06-18; that path is off by default — set
+   `USE_GEMINI_EXIT_CLI=1` only with a paid-key-backed CLI.)
 
 A prompt rule forbids the analyst from inventing news when no headlines are supplied —
 absence of data must be stated, not hallucinated.
@@ -43,6 +48,14 @@ cp .env.example ~/.env        # fill in your keys
 
 Keys required in `~/.env`: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `GEMINI_API_KEY`,
 `ANTHROPIC_API_KEY`, `HF_API_TOKEN`. See `.env.example`.
+
+**Optional — Claude Sonnet via subscription.** To run the risk/exit gate on Claude
+**Sonnet** through the Claude Agent SDK (drawing on the free ~$20/mo subscription
+credit instead of metered Haiku API tokens), add `CLAUDE_CODE_OAUTH_TOKEN` (from
+`claude setup-token`). Tunables: `CLAUDE_SDK_FOR` (`exits` [default] | `all` |
+`none`), `CLAUDE_SDK_MONTHLY_CAP_USD` (default `20`), `CLAUDE_SDK_MODEL` (default
+`sonnet`). The credit pool is shared with the sibling `DOWTrade` bot via
+`~/.claude_sdk_credit.json`; with no token the bot runs Haiku-only, exactly as before.
 
 ## Run
 
