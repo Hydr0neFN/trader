@@ -15,13 +15,15 @@ Each run (every 30 min, 9:30–16:00 ET, weekdays) executes a pipeline per ticke
 2. **Analyst** (Gemini) — BUY/SELL/HOLD recommendation with confidence + reasoning.
    Walks a model-priority chain (`gemini-3.5-flash` → `gemini-3.1-pro` → … →
    `gemini-2.5-flash`) so it degrades gracefully when a model is quota-gated.
-3. **Sentiment** (Hugging Face) — BULLISH/BEARISH/NEUTRAL second opinion.
+3. **Sentiment** (Hugging Face) — BULLISH/BEARISH/NEUTRAL second opinion. It only
+   blocks a trade when it **directly contradicts** the analyst (BUY vs BEARISH, or
+   SELL vs BULLISH); NEUTRAL (quiet/empty news) does not veto.
 4. **Risk** (Claude) — final gate; vetoes unsafe trades. Uses **Sonnet** via the
-   Claude Agent SDK (free subscription credit) for the crucial exit decisions and
-   the **Haiku** API for the high-volume buy screen; falls back to Haiku whenever
-   the credit is depleted or no subscription token is configured.
-5. **Execution** — Alpaca paper order; hard stop-loss floor enforced independently
-   of the LLMs.
+   Claude Agent SDK — drawing on your **Claude Pro plan's included usage** — for the
+   crucial exit decisions, and the **Haiku** API for the high-volume buy screen;
+   falls back to Haiku when no subscription token is configured.
+5. **Execution** — Alpaca paper order; a hard stop-loss floor **and a
+   profit-protecting trailing stop** are enforced independently of the LLMs.
 6. **Exit analysis** — open positions are re-evaluated by a separate Gemini **API**
    exit analyst + a Claude exit-risk gate. (Google retired the individual-tier
    `gemini-cli` on 2026-06-18; that path is off by default — set
@@ -35,9 +37,17 @@ absence of data must be stated, not hallucinated.
 | Rail | Default | Env override |
 |------|---------|--------------|
 | Hard stop-loss | 5% | `STOP_LOSS_PCT` |
+| Trailing stop (pullback from peak) | 3.5% | `TRAIL_STOP_PCT` |
+| Trailing-stop activation (gain before it arms) | 3% | `TRAIL_ACTIVATE_PCT` |
 | Position size | 2% of equity | `POSITION_SIZE_PCT` |
 | Max concurrent positions | 8 | `MAX_POSITIONS` |
 | Tickers per batch | 10 | `TICKER_BATCH_SIZE` |
+
+The **trailing stop** arms only after a position's running peak gains
+`TRAIL_ACTIVATE_PCT` above entry, then exits on a `TRAIL_STOP_PCT` pullback from
+that peak — locking in gains on winners while leaving the hard floor to govern
+names that never ran up. Peaks persist in `trade_logs/position_peaks.json` and are
+sampled each run.
 
 ## Setup
 
@@ -50,12 +60,12 @@ Keys required in `~/.env`: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `GEMINI_API_KE
 `ANTHROPIC_API_KEY`, `HF_API_TOKEN`. See `.env.example`.
 
 **Optional — Claude Sonnet via subscription.** To run the risk/exit gate on Claude
-**Sonnet** through the Claude Agent SDK (drawing on the free ~$20/mo subscription
-credit instead of metered Haiku API tokens), add `CLAUDE_CODE_OAUTH_TOKEN` (from
-`claude setup-token`). Tunables: `CLAUDE_SDK_FOR` (`exits` [default] | `all` |
-`none`), `CLAUDE_SDK_MONTHLY_CAP_USD` (default `20`), `CLAUDE_SDK_MODEL` (default
-`sonnet`). The credit pool is shared with the sibling `DOWTrade` bot via
-`~/.claude_sdk_credit.json`; with no token the bot runs Haiku-only, exactly as before.
+**Sonnet** through the Claude Agent SDK — drawing on your **Claude Pro plan's
+included usage** rather than metered Haiku API tokens — add `CLAUDE_CODE_OAUTH_TOKEN`
+(from `claude setup-token`). Tunables: `CLAUDE_SDK_FOR` (`exits` [default] | `all` |
+`none`), `CLAUDE_SDK_MODEL` (default `sonnet`), and `CLAUDE_SDK_MONTHLY_CAP_USD` (an
+optional self-imposed monthly spend guard). With no token the bot runs Haiku-only,
+exactly as before.
 
 ## Run
 
@@ -69,12 +79,17 @@ via Alpaca's clock endpoint), so it exits early when the market is closed.
 ### Cron (every 30 min during market hours)
 
 ```cron
-*/30 9-15 * * 1-5 /usr/bin/python3 /path/to/trader.py >> /path/to/trade_logs/cron.log 2>&1
+*/30 9-15 * * 1-5 flock -n /tmp/trader.lock /usr/bin/python3 /path/to/trader.py >> /path/to/trade_logs/cron.log 2>&1
 ```
+
+`flock -n` keeps overlapping runs from stacking up if one is slow. Adjust the hour
+range to your server's timezone — the bot self-enforces the ET window regardless.
 
 ## Dashboard
 
-A small Flask app in `dashboard/` shows positions, decisions, and history.
+A small Flask app in `dashboard/` shows positions, decisions, and history. The
+overview page charts portfolio value over time with a **high-water-mark line and
+drawdown shading**.
 
 ```bash
 python3 dashboard/app.py

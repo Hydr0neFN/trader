@@ -128,9 +128,14 @@ let chart = null;
 
 function buildChart(data) {
   const ctx = document.getElementById('portfolioChart').getContext('2d');
-  const grad = ctx.createLinearGradient(0, 0, 0, 260);
+  const grad = ctx.createLinearGradient(0, 0, 0, 280);
   grad.addColorStop(0, 'rgba(31,111,235,.35)');
   grad.addColorStop(1, 'rgba(31,111,235,0)');
+
+  // Running high-water mark; the shaded gap down to the value line = drawdown.
+  const values = data.map(d => d.value);
+  let peak = -Infinity;
+  const hwm = values.map(v => { peak = Math.max(peak, v); return peak; });
 
   if (chart) chart.destroy();
 
@@ -138,17 +143,33 @@ function buildChart(data) {
     type: 'line',
     data: {
       labels: data.map(d => d.label),
-      datasets: [{
-        label: 'Portfolio Value',
-        data:   data.map(d => d.value),
-        borderColor: '#1f6feb',
-        backgroundColor: grad,
-        borderWidth: 2,
-        pointRadius: data.length > 20 ? 0 : 3,
-        pointHoverRadius: 5,
-        fill: true,
-        tension: 0.3,
-      }]
+      datasets: [
+        {
+          label: 'Portfolio Value',
+          data:   values,
+          borderColor: '#1f6feb',
+          backgroundColor: grad,
+          borderWidth: 2,
+          pointRadius: data.length > 20 ? 0 : 3,
+          pointHoverRadius: 5,
+          fill: true,
+          tension: 0.3,
+          order: 1,
+        },
+        {
+          label: 'High-Water Mark',
+          data: hwm,
+          borderColor: 'rgba(210,153,34,.55)',
+          borderWidth: 1.5,
+          borderDash: [4, 4],
+          pointRadius: 0,
+          pointHoverRadius: 0,
+          fill: '-1',
+          backgroundColor: 'rgba(248,81,73,.08)',
+          tension: 0.3,
+          order: 2,
+        }
+      ]
     },
     options: {
       responsive: true,
@@ -157,22 +178,34 @@ function buildChart(data) {
       plugins: {
         legend: { display: false },
         tooltip: {
+          backgroundColor: '#121824',
+          borderColor: '#26324d',
+          borderWidth: 1,
           callbacks: {
-            label: c => '$' + c.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2})
+            label: c => {
+              if (c.datasetIndex === 1) {
+                return 'Peak: $' + c.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2});
+              }
+              const pk = hwm[c.dataIndex];
+              const dd = c.parsed.y - pk;
+              const out = ['Value: $' + c.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2})];
+              if (dd < -0.01) out.push('Drawdown: ' + (dd / pk * 100).toFixed(2) + '%');
+              return out;
+            }
           }
         }
       },
       scales: {
         x: {
           ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 },
-          grid:  { color: '#21262d' }
+          grid:  { color: 'rgba(38,50,77,.5)' }
         },
         y: {
           ticks: {
             color: '#8b949e',
             callback: v => '$' + v.toLocaleString('en-US', {minimumFractionDigits:0})
           },
-          grid: { color: '#21262d' }
+          grid: { color: 'rgba(38,50,77,.5)' }
         }
       }
     }

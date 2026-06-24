@@ -9,29 +9,52 @@
   <title>{% block title %}Trader Dashboard{% endblock %}</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
-    body { background: #0d1117; }
+    :root {
+      --bg:        #090d16;
+      --card:      #121824;
+      --card-head: #192030;
+      --border:    #26324d;
+      --text:      #cdd9e5;
+      --muted:     #8b949e;
+      --pos:       #3fb950;
+      --neg:       #f85149;
+      --warn:      #d29922;
+      --accent:    #1f6feb;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .navbar { background: var(--card) !important; border-color: var(--border) !important; }
     .navbar-brand { font-weight: 700; letter-spacing: .5px; }
-    .card { background: #161b22; border: 1px solid #30363d; }
-    .card-header { background: #1c2128; border-bottom: 1px solid #30363d; font-weight: 600; }
-    .stat-card { transition: transform .15s; }
-    .stat-card:hover { transform: translateY(-2px); }
-    .stat-value { font-size: 1.6rem; font-weight: 700; }
-    .stat-label { font-size: .78rem; text-transform: uppercase; letter-spacing: .6px; color: #8b949e; }
-    .pnl-pos { color: #3fb950; }
-    .pnl-neg { color: #f85149; }
-    .badge-buy  { background: #1a4731; color: #3fb950; border: 1px solid #2ea043; }
-    .badge-sell { background: #3d1c1c; color: #f85149; border: 1px solid #da3633; }
-    .badge-veto { background: #2d2a1e; color: #d29922; border: 1px solid #9e6a03; }
-    .badge-hold { background: #1c2128; color: #8b949e; border: 1px solid #30363d; }
-    .badge-approved { background: #1a4731; color: #3fb950; border: 1px solid #2ea043; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
+    .card-header { background: var(--card-head); border-bottom: 1px solid var(--border); font-weight: 600; }
+    .stat-card { transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease; }
+    .stat-card:hover { transform: translateY(-2px); border-color: var(--accent); box-shadow: 0 4px 16px rgba(31,111,235,.15); }
+    .stat-value { font-size: 1.6rem; font-weight: 800; letter-spacing: -.5px; }
+    .stat-label { font-size: .78rem; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); font-weight: 600; }
+    .mono { font-family: 'Geist Mono', ui-monospace, SFMono-Regular, monospace; }
+    .stat-value, table td, table th { font-variant-numeric: tabular-nums; }
+    .pnl-pos { color: var(--pos); }
+    .pnl-neg { color: var(--neg); }
+    .badge-buy      { background: rgba(63,185,80,.12);   color: #4ae05d; border: 1px solid rgba(63,185,80,.30); }
+    .badge-sell     { background: rgba(248,81,73,.12);   color: #ff6e67; border: 1px solid rgba(248,81,73,.30); }
+    .badge-veto     { background: rgba(210,153,34,.12);  color: #e3b341; border: 1px solid rgba(210,153,34,.30); }
+    .badge-hold     { background: rgba(139,148,158,.12); color: #adbac7; border: 1px solid rgba(139,148,158,.30); }
+    .badge-approved { background: rgba(63,185,80,.12);   color: #4ae05d; border: 1px solid rgba(63,185,80,.30); }
     table { font-size: .9rem; }
-    .nav-link.active { background: #1f6feb !important; border-radius: 6px; }
-    .reasoning-text { font-size: .82rem; color: #8b949e; line-height: 1.4; }
-    .chart-container { position: relative; height: 260px; }
+    .table-hover tbody tr:hover > * { background-color: rgba(38,50,77,.25) !important; }
+    .nav-link.active { background: var(--accent) !important; border-radius: 6px; }
+    .reasoning-text { font-size: .82rem; color: #adbac7; line-height: 1.45; }
+    .chart-container { position: relative; height: 280px; }
     @media (max-width: 576px) {
       .stat-value { font-size: 1.2rem; }
-      .chart-container { height: 200px; }
+      .chart-container { height: 220px; }
     }
   </style>
   {% block head %}{% endblock %}

@@ -47,6 +47,14 @@ HF_API_TOKEN      = os.environ["HF_API_TOKEN"]
 # Raised to 5% to give the AI exit analysis room to work.
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "5"))
 
+# Trailing stop (profit-protecting), independent of the hard floor above.
+# Arms only after a position's running peak gains >= TRAIL_ACTIVATE_PCT above
+# entry, then exits on a >= TRAIL_STOP_PCT pullback from that peak — locking in
+# gains on winners without tightening the hard floor on names that never ran up.
+# Peaks are sampled each run (cron cadence), not true intraday highs.
+TRAIL_STOP_PCT     = float(os.environ.get("TRAIL_STOP_PCT",     "3.5"))
+TRAIL_ACTIVATE_PCT = float(os.environ.get("TRAIL_ACTIVATE_PCT", "3.0"))
+
 # Top S&P 500 by market cap.
 # NOTE: BRK-B was removed — yfinance uses "BRK-B" but Alpaca's trading/news API
 # uses "BRK.B", so that name could never fetch news or fill an order (it only
@@ -1032,9 +1040,14 @@ def print_portfolio_summary(client: TradingClient) -> None:
 # ── Step 0a: Hard stop-loss (math only, no AI) ───────────────────────────────
 
 def check_hard_stops(alpaca: TradingClient, run_ts: str) -> list:
-    """Immediately sell any position whose unrealised loss >= STOP_LOSS_PCT.
+    """Immediately sell any position that breaches the hard floor OR a trailing stop.
 
-    This is the hard safety floor — no AI consultation, runs before anything else.
+    Two AI-independent safety rules, evaluated before anything else:
+      • HARD FLOOR — unrealised loss >= STOP_LOSS_PCT from entry.
+      • TRAILING   — once a position's running peak is >= TRAIL_ACTIVATE_PCT above
+                     entry, exit on a >= TRAIL_STOP_PCT pullback from that peak
+                     (locks in profit on winners).
+    Running peaks persist in PEAKS_FILE and are sampled each run (cron cadence).
     Returns list of tickers that were market-sold.
     """
     try:
@@ -1043,18 +1056,36 @@ def check_hard_stops(alpaca: TradingClient, run_ts: str) -> list:
         log.error("Could not fetch positions for stop-loss check: %s", exc)
         return []
 
+    peaks = load_peaks()
     sold_tickers: list = []
 
     for p in positions:
         ticker    = p.symbol
         current   = float(p.current_price)
+        entry     = float(p.avg_entry_price)
         plpc      = float(p.unrealized_plpc) * 100
         qty       = int(float(p.qty))
 
-        if plpc > -STOP_LOSS_PCT:
+        # Update the running high-water mark since entry.
+        peak = max(peaks.get(ticker, entry), current)
+        peaks[ticker] = round(peak, 4)
+
+        gain_from_entry = (peak - entry) / entry * 100 if entry else 0.0
+        drawdown        = (peak - current) / peak * 100 if peak else 0.0
+        trailing_armed  = gain_from_entry >= TRAIL_ACTIVATE_PCT
+
+        hit_hard     = plpc <= -STOP_LOSS_PCT
+        hit_trailing = trailing_armed and drawdown >= TRAIL_STOP_PCT
+        if not (hit_hard or hit_trailing):
             continue
 
-        reason = f"HARD STOP-LOSS at {plpc:.2f}% (threshold: -{STOP_LOSS_PCT}%)"
+        if hit_hard:
+            exit_type = "STOP-LOSS"
+            reason = f"HARD STOP-LOSS at {plpc:.2f}% (threshold: -{STOP_LOSS_PCT}%)"
+        else:
+            exit_type = "TRAILING-STOP"
+            reason = (f"TRAILING STOP: -{drawdown:.2f}% from peak ${peak:.2f} "
+                      f"(armed +{gain_from_entry:.2f}%, threshold -{TRAIL_STOP_PCT}%)")
         log.warning("  %-6s  %s", ticker, reason)
         try:
             order = alpaca.submit_order(MarketOrderRequest(
@@ -1071,15 +1102,21 @@ def check_hard_stops(alpaca: TradingClient, run_ts: str) -> list:
                 "qty":       qty,
                 "price":     current,
                 "order_id":  str(order.id),
-                "exit_type": "STOP-LOSS",
+                "exit_type": exit_type,
                 "reason":    reason,
                 **fees,
             })
-            log.info("  Hard-stopped %dx %s @ ~$%.2f | order %s",
-                     qty, ticker, current, order.id)
+            log.info("  %s %dx %s @ ~$%.2f | order %s",
+                     exit_type, qty, ticker, current, order.id)
             sold_tickers.append(ticker)
         except Exception as exc:
             log.error("  Stop-loss order failed for %s: %s", ticker, exc)
+
+    # Drop peaks for tickers we no longer hold (closed or just sold) so the file
+    # stays bounded and a later re-buy starts a fresh high-water mark.
+    held  = {p.symbol for p in positions} - set(sold_tickers)
+    peaks = {t: v for t, v in peaks.items() if t in held}
+    save_peaks(peaks)
 
     return sold_tickers
 
@@ -1508,9 +1545,11 @@ def main() -> None:
 
         # 3c. Three-way gate
         hf_sentiment = hf.get("sentiment", "NEUTRAL")
-        sentiment_ok = (
-            (action == "BUY"  and hf_sentiment == "BULLISH") or
-            (action == "SELL" and hf_sentiment == "BEARISH")
+        # Only veto when sentiment actively CONTRADICTS the signal; NEUTRAL
+        # (quiet/empty news) no longer blocks an otherwise-approved trade.
+        sentiment_ok = not (
+            (action == "BUY"  and hf_sentiment == "BEARISH") or
+            (action == "SELL" and hf_sentiment == "BULLISH")
         )
 
         veto_reasons = []
