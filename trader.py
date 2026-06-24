@@ -448,13 +448,10 @@ def run_sentiment_analyst(data_block: str) -> dict:
 # on the subscription's included usage instead of metered API tokens.
 #
 # Fallback path is the original metered Anthropic API on **Haiku**. It is used
-# whenever: the SDK is disabled, no OAuth token is present, the shared monthly
-# credit cap is reached, or any SDK call errors. With no token configured the
-# bot behaves exactly as before (Haiku-only), so this is safe to deploy before
-# the subscription login is completed.
-#
-# The monthly-spend ledger is SHARED with the other bot (DOWTrade) via one file
-# so both draw down the same ~$20 subscription pool — see CLAUDE_SDK_CREDIT_FILE.
+# whenever the SDK is disabled, no OAuth token is present, or any SDK call
+# errors. With no token configured the bot behaves exactly as before
+# (Haiku-only), so this is safe to deploy before the subscription login is
+# completed.
 
 CLAUDE_SDK_ENABLED = os.environ.get("CLAUDE_SDK_ENABLED", "1").lower() in ("1", "true", "yes")
 CLAUDE_OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
@@ -462,13 +459,6 @@ CLAUDE_SDK_MODEL   = os.environ.get("CLAUDE_SDK_MODEL", "sonnet")
 CLAUDE_API_MODEL   = os.environ.get("CLAUDE_API_MODEL", "claude-haiku-4-5-20251001")
 CLAUDE_CLI_PATH    = os.environ.get("CLAUDE_CLI_PATH", "claude")
 CLAUDE_SDK_TIMEOUT = int(os.environ.get("CLAUDE_SDK_TIMEOUT", "120"))
-CLAUDE_SDK_CAP_USD = float(os.environ.get("CLAUDE_SDK_MONTHLY_CAP_USD", "20"))
-CLAUDE_CREDIT_FILE = Path(os.environ.get(
-    "CLAUDE_SDK_CREDIT_FILE", str(Path.home() / ".claude_sdk_credit.json")))
-
-# Sonnet 4.x list pricing (USD/token) — used to value subscription usage against
-# the monthly cap when the CLI reports total_cost_usd == 0 (subscription mode).
-_SONNET_IN_USD, _SONNET_OUT_USD = 3e-6, 15e-6
 # Prepended to every SDK system prompt. The `claude` CLI is an agentic harness,
 # not a raw API: without this it adds conversational preamble or refuses to
 # "rubber-stamp" trades, which breaks JSON parsing and defaults the gate to VETO.
@@ -484,11 +474,9 @@ _sdk_state = {"fails": 0, "off": False}
 _SDK_MAX_FAILS = 3
 
 # Which Claude calls may use Sonnet-via-SDK: all | exits | none.
-# Default 'exits' — concentrate the free subscription credit (~$20/mo) on the
-# crucial, low-volume EXIT decisions (selling = realizing P&L) where Sonnet's
-# judgment matters most, spread across the whole month. The high-volume buy
-# screen stays on Haiku. When the $20 is depleted, exits fall back to Haiku too.
-# Set CLAUDE_SDK_FOR=all to use Sonnet everywhere (burns the free credit fast).
+# Default 'exits' — use Sonnet's stronger judgment on the crucial, low-volume
+# EXIT decisions (selling = realizing P&L); the high-volume buy screen stays on
+# Haiku. Set CLAUDE_SDK_FOR=all to route every Claude call through Sonnet.
 CLAUDE_SDK_FOR = os.environ.get("CLAUDE_SDK_FOR", "exits").lower()
 
 
@@ -500,38 +488,11 @@ def _sdk_allowed_for(call_type: str) -> bool:
     return call_type == "exit"
 
 
-def _sdk_month() -> str:
-    return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m")
-
-
-def _sdk_credit_spent() -> float:
-    try:
-        return float(json.loads(CLAUDE_CREDIT_FILE.read_text()).get(_sdk_month(), 0.0))
-    except Exception:
-        return 0.0
-
-
-def _sdk_credit_add(cost_usd: float) -> None:
-    month = _sdk_month()
-    try:
-        ledger = json.loads(CLAUDE_CREDIT_FILE.read_text())
-    except Exception:
-        ledger = {}
-    ledger[month] = round(float(ledger.get(month, 0.0)) + max(0.0, cost_usd), 6)
-    try:  # atomic write so the concurrent (DOWTrade) writer can't read half a file
-        tmp = CLAUDE_CREDIT_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(ledger))
-        os.replace(tmp, CLAUDE_CREDIT_FILE)
-    except Exception as exc:
-        log.warning("Could not persist SDK credit ledger: %s", exc)
-
-
 def _claude_use_sdk() -> bool:
     return (
         CLAUDE_SDK_ENABLED
         and bool(CLAUDE_OAUTH_TOKEN)
         and not _sdk_state["off"]
-        and _sdk_credit_spent() < CLAUDE_SDK_CAP_USD
     )
 
 
@@ -539,8 +500,9 @@ def _claude_via_sdk(system: str, user: str) -> tuple:
     """One-shot Claude Sonnet call via the `claude` CLI (subscription auth).
 
     Runs from /tmp with ANTHROPIC_API_KEY stripped so the CLI uses the OAuth
-    subscription token (the $20 credit) rather than metered API billing.
-    Returns (text, cost_usd); raises on any error so the caller can fall back.
+    subscription token (your Pro plan's included usage) rather than metered API
+    billing. Returns the response text; raises on any error so the caller can
+    fall back to the Haiku API.
     """
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     env["CLAUDE_CODE_OAUTH_TOKEN"] = CLAUDE_OAUTH_TOKEN
@@ -564,12 +526,7 @@ def _claude_via_sdk(system: str, user: str) -> tuple:
     text = (payload.get("result") or "").strip()
     if not text:
         raise RuntimeError("claude empty result")
-    cost = float(payload.get("total_cost_usd") or 0.0)
-    if cost <= 0:  # subscription mode often reports 0 — value it via token usage
-        u = payload.get("usage", {}) or {}
-        cost = ((u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)) * _SONNET_IN_USD
-                + u.get("output_tokens", 0) * _SONNET_OUT_USD)
-    return text, cost
+    return text
 
 
 def _claude_via_api(system: str, user: str, max_tokens: int) -> str:
@@ -595,8 +552,7 @@ def claude_complete(system: str, user: str, max_tokens: int, label: str = "",
     """
     if _sdk_allowed_for(call_type) and _claude_use_sdk():
         try:
-            text, cost = _claude_via_sdk(system, user)
-            _sdk_credit_add(cost)
+            text = _claude_via_sdk(system, user)
             _sdk_state["fails"] = 0
             return text, "sonnet-sdk"
         except Exception as exc:

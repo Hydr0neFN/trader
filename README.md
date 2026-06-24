@@ -63,9 +63,8 @@ Keys required in `~/.env`: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `GEMINI_API_KE
 **Sonnet** through the Claude Agent SDK — drawing on your **Claude Pro plan's
 included usage** rather than metered Haiku API tokens — add `CLAUDE_CODE_OAUTH_TOKEN`
 (from `claude setup-token`). Tunables: `CLAUDE_SDK_FOR` (`exits` [default] | `all` |
-`none`), `CLAUDE_SDK_MODEL` (default `sonnet`), and `CLAUDE_SDK_MONTHLY_CAP_USD` (an
-optional self-imposed monthly spend guard). With no token the bot runs Haiku-only,
-exactly as before.
+`none`) and `CLAUDE_SDK_MODEL` (default `sonnet`). With no token the bot runs
+Haiku-only, exactly as before.
 
 ## Run
 
