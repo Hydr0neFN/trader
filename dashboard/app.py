@@ -194,20 +194,25 @@ def positions():
 
     try:
         client    = get_alpaca()
+        account   = cached("account", 20, client.get_account)
         positions = cached("positions", 20, client.get_all_positions)
+        port_val  = float(account.portfolio_value) if account else 0.0
 
         for p in positions:
+            mv = float(p.market_value)
             rows.append({
                 "symbol":       p.symbol,
                 "qty":          float(p.qty),
                 "avg_entry":    float(p.avg_entry_price),
                 "current":      float(p.current_price),
-                "market_value": float(p.market_value),
+                "market_value": mv,
                 "unreal_pl":    float(p.unrealized_pl),
                 "unreal_plpct": float(p.unrealized_plpc) * 100,
                 # PositionSide is a str-Enum: str(p.side) → "PositionSide.long".
                 # Use .value so the template's r.side == 'LONG' check matches.
                 "side":         str(getattr(p.side, "value", p.side)).upper(),
+                # Portfolio weight — share of total equity in this position.
+                "allocation":   (mv / port_val * 100) if port_val else 0.0,
             })
     except Exception as exc:
         error = str(exc)

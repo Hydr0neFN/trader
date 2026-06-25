@@ -25,6 +25,7 @@
           <th class="text-end">Avg Entry</th>
           <th class="text-end">Current</th>
           <th class="text-end">Market Value</th>
+          <th class="text-end" style="min-width:120px;">Allocation</th>
           <th class="text-end pe-3">Unrealized P&amp;L</th>
         </tr>
       </thead>
@@ -37,14 +38,22 @@
               {{ r.side }}
             </span>
           </td>
-          <td class="text-end">{{ r.qty | int }}</td>
-          <td class="text-end">{{ r.avg_entry | fmt_currency }}</td>
-          <td class="text-end">{{ r.current | fmt_currency }}</td>
-          <td class="text-end">{{ r.market_value | fmt_currency }}</td>
+          <td class="text-end mono">{{ r.qty | int }}</td>
+          <td class="text-end mono">{{ r.avg_entry | fmt_currency }}</td>
+          <td class="text-end mono">{{ r.current | fmt_currency }}</td>
+          <td class="text-end mono">{{ r.market_value | fmt_currency }}</td>
+          <td class="text-end">
+            <div class="d-flex align-items-center justify-content-end gap-2">
+              <div class="alloc-bar flex-grow-1" style="max-width:70px;"><span style="width:{{ r.allocation | round(1) }}%;"></span></div>
+              <span class="mono text-white" style="font-size:.8rem; min-width:40px;">{{ r.allocation | round(1) }}%</span>
+            </div>
+          </td>
           <td class="text-end pe-3">
-            <span class="{% if r.unreal_pl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
-              {{ r.unreal_pl | fmt_currency }}
-              <br><small>{{ r.unreal_plpct | fmt_pct }}</small>
+            {% set pct = r.unreal_plpct %}
+            {% if pct >= 5 %}{% set hc = 'pos3' %}{% elif pct >= 1 %}{% set hc = 'pos2' %}{% elif pct >= 0 %}{% set hc = 'pos1' %}{% elif pct <= -5 %}{% set hc = 'neg3' %}{% elif pct <= -1 %}{% set hc = 'neg2' %}{% else %}{% set hc = 'neg1' %}{% endif %}
+            <span class="pl-heat {{ hc }}">
+              <span class="v mono">{{ r.unreal_pl | fmt_currency }}</span>
+              <span class="p mono">{{ r.unreal_plpct | fmt_pct }}</span>
             </span>
           </td>
         </tr>

@@ -52,6 +52,17 @@
     .nav-link.active { background: var(--accent) !important; border-radius: 6px; }
     .reasoning-text { font-size: .82rem; color: #adbac7; line-height: 1.45; }
     .chart-container { position: relative; height: 280px; }
+    .pl-heat { display:inline-flex; flex-direction:column; align-items:flex-end; padding:4px 10px; border-radius:6px; min-width:92px; }
+    .pl-heat .v { font-size:.85rem; font-weight:700; }
+    .pl-heat .p { font-size:.72rem; opacity:.85; }
+    .pl-heat.pos1 { background:rgba(63,185,80,.07);  color:#4ae05d; border:1px solid rgba(63,185,80,.18); }
+    .pl-heat.pos2 { background:rgba(63,185,80,.15);  color:#56ee6a; border:1px solid rgba(63,185,80,.38); }
+    .pl-heat.pos3 { background:rgba(63,185,80,.24);  color:#66ff7c; border:1px solid rgba(63,185,80,.55); }
+    .pl-heat.neg1 { background:rgba(248,81,73,.07);  color:#ff6e67; border:1px solid rgba(248,81,73,.18); }
+    .pl-heat.neg2 { background:rgba(248,81,73,.15);  color:#ff857f; border:1px solid rgba(248,81,73,.38); }
+    .pl-heat.neg3 { background:rgba(248,81,73,.24);  color:#ff9e99; border:1px solid rgba(248,81,73,.55); }
+    .alloc-bar { height:6px; border-radius:3px; background:rgba(48,54,61,.6); overflow:hidden; }
+    .alloc-bar > span { display:block; height:100%; background:var(--accent); border-radius:3px; }
     @media (max-width: 576px) {
       .stat-value { font-size: 1.2rem; }
       .chart-container { height: 220px; }
