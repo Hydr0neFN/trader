@@ -63,6 +63,16 @@
     .pl-heat.neg3 { background:rgba(248,81,73,.24);  color:#ff9e99; border:1px solid rgba(248,81,73,.55); }
     .alloc-bar { height:6px; border-radius:3px; background:rgba(48,54,61,.6); overflow:hidden; }
     .alloc-bar > span { display:block; height:100%; background:var(--accent); border-radius:3px; }
+    .pipe { display:flex; flex-direction:column; padding:4px 2px; }
+    .pipe-step { position:relative; padding-left:34px; margin-bottom:18px; }
+    .pipe-step::before { content:""; position:absolute; left:11px; top:22px; bottom:-18px; width:2px; background:var(--border); }
+    .pipe-step:last-child::before { display:none; }
+    .pipe-ic { position:absolute; left:0; top:0; width:24px; height:24px; border-radius:50%; background:var(--bg); border:2px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:.72rem; color:var(--muted); }
+    .pipe-step.ok   .pipe-ic { border-color:var(--pos);    color:var(--pos); }
+    .pipe-step.no   .pipe-ic { border-color:var(--neg);    color:var(--neg); }
+    .pipe-step.info .pipe-ic { border-color:var(--accent); color:var(--accent); }
+    .pipe-t { font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); margin-bottom:6px; }
+    .pipe-card { background:var(--card-head); border:1px solid var(--border); border-radius:8px; padding:12px; font-size:.82rem; }
     @media (max-width: 576px) {
       .stat-value { font-size: 1.2rem; }
       .chart-container { height: 220px; }

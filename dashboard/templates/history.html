@@ -221,36 +221,69 @@ function escHtml(s) {
 
 function renderModal(row) {
   const ticker = row.ticker || '?';
-  const act    = (row.action || row.recommendation || '').toUpperCase();
-  const actBadge = {BUY:'badge-buy',SELL:'badge-sell',HOLD:'badge-hold',VETOED:'badge-veto'}[act] || 'bg-secondary';
+  const act = (row.final_action || row.action || row.recommendation ||
+               row.gemini_recommendation || row.gemini_exit_action || '').toString().toUpperCase();
+  const actBadge = {BUY:'badge-buy',SELL:'badge-sell',HOLD:'badge-hold',EXIT:'badge-sell',
+                    TRIM:'badge-veto',VETOED:'badge-veto',EXITED:'badge-sell',
+                    TRIMMED:'badge-veto',HELD:'badge-hold'}[act] || 'bg-secondary';
 
   document.getElementById('modalTitle').innerHTML =
     `<span class="fw-bold text-white me-2">${escHtml(ticker)}</span>` +
     `<span class="badge ${actBadge} me-2">${escHtml(act || '?')}</span>` +
     `<span class="text-secondary" style="font-size:.78rem;">${fmtValue('timestamp', row.timestamp)}</span>`;
 
-  // Build ordered rows first, then any extra keys
-  const rendered = new Set();
-  let html = '<table class="table table-sm table-dark mb-0" style="font-size:.83rem;table-layout:fixed;width:100%;">' +
-             '<colgroup><col style="width:150px;"><col></colgroup>' +
-             '<tbody>';
+  // Pick the first present key from a list (buy- and exit-decisions use different keys).
+  const pick = (...keys) => { for (const k of keys) if (row[k] !== undefined && row[k] !== null && row[k] !== '') return k; return null; };
+  const kv = (label, key) => key ? `<div class="d-flex justify-content-between gap-3" style="margin:2px 0;"><span class="text-secondary">${escHtml(label)}</span><span style="text-align:right;">${fmtValue(key, row[key])}</span></div>` : '';
+  const longText = (label, key) => key ? `<div class="pipe-t" style="margin-top:8px;">${escHtml(label)}</div><div class="reasoning-text" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;white-space:pre-wrap;word-break:break-word;">${escHtml(String(row[key]))}</div>` : '';
 
-  function addRow(key) {
-    if (rendered.has(key) || !(key in row)) return;
-    rendered.add(key);
-    const label = FIELD_LABELS[key] || key.replace(/_/g,' ');
-    const isLong = typeof row[key] === 'string' && row[key].length > 80;
-    html += `<tr>
-      <td style="color:#8b949e;white-space:nowrap;vertical-align:top;">${escHtml(label)}</td>
-      <td style="white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;overflow:hidden;">${fmtValue(key, row[key])}</td>
-    </tr>`;
+  let html = '<div class="pipe">';
+
+  // Stage 1 — Market data at run
+  const mkeys = ['current_price','daily_change_pct','volume','ma5','ma20','ma50'].filter(k => k in row);
+  if (mkeys.length) {
+    html += `<div class="pipe-step info"><div class="pipe-ic"><i class="bi bi-bar-chart"></i></div>` +
+      `<div class="pipe-t">Market data at run</div><div class="pipe-card">${mkeys.map(k => kv(FIELD_LABELS[k]||k, k)).join('')}</div></div>`;
   }
 
-  FIELD_ORDER.forEach(addRow);
-  // Remaining keys not in FIELD_ORDER
-  Object.keys(row).forEach(k => { if (!rendered.has(k)) addRow(k); });
+  // Stage 2 — AI analysis (Gemini + HF sentiment)
+  const gRec = pick('gemini_recommendation','recommendation','gemini_exit_action');
+  const gConf = pick('gemini_confidence','confidence','gemini_exit_confidence');
+  const gModel = pick('gemini_model','gemini_exit_model');
+  const gReas = pick('gemini_reasoning','reasoning','gemini_exit_reasoning');
+  const hfSent = pick('hf_sentiment');
+  if (gRec || gReas || hfSent) {
+    html += `<div class="pipe-step info"><div class="pipe-ic"><i class="bi bi-cpu"></i></div><div class="pipe-t">AI analysis</div><div class="pipe-card">`;
+    if (gRec || gConf || gModel || gReas) html += `<div class="mb-1"><i class="bi bi-stars me-1 text-info"></i><span class="fw-semibold text-white">Gemini</span></div>`;
+    html += kv('Recommendation', gRec) + kv('Confidence', gConf) + kv('Model', gModel) + longText('Reasoning', gReas);
+    if (hfSent && String(row[hfSent]).toUpperCase() !== 'N/A') {
+      html += `<div class="mt-2 pt-2 border-top border-secondary-subtle"><i class="bi bi-newspaper me-1 text-warning"></i><span class="fw-semibold text-white">HF sentiment</span></div>`;
+      html += kv('Sentiment', hfSent) + kv('Confidence', pick('hf_confidence')) + longText('Reasoning', pick('hf_reasoning'));
+    }
+    html += `</div></div>`;
+  }
 
-  html += '</tbody></table>';
+  // Stage 3 — Risk gate (Claude Haiku)
+  const hVerdict = pick('haiku_verdict','haiku_exit_verdict');
+  const hJust = pick('haiku_justification','haiku_exit_justification');
+  const vetoR = pick('veto_reasons');
+  const vetoed = (row._type === 'vetoed') || (hVerdict && String(row[hVerdict]).toUpperCase() !== 'APPROVED');
+  if (hVerdict || hJust || vetoR) {
+    html += `<div class="pipe-step ${vetoed ? 'no' : 'ok'}"><div class="pipe-ic"><i class="bi bi-shield-check"></i></div><div class="pipe-t">Risk gate — Claude Haiku</div><div class="pipe-card">`;
+    html += kv('Verdict', hVerdict) + longText('Justification', hJust) + longText('Veto reasons', vetoR);
+    html += `</div></div>`;
+  }
+
+  // Stage 4 — Settlement / outcome
+  const skeys = ['action','final_action','exit_type','qty','price','order_id',
+                 'sim_sec_fee','sim_finra_taf','sim_slippage','sim_total_fee'].filter(k => k in row);
+  if (skeys.length) {
+    const fail = row._type === 'vetoed';
+    html += `<div class="pipe-step ${fail ? 'no' : 'ok'}"><div class="pipe-ic"><i class="bi bi-wallet2"></i></div>` +
+      `<div class="pipe-t">Settlement</div><div class="pipe-card">${skeys.map(k => kv(FIELD_LABELS[k]||k, k)).join('')}</div></div>`;
+  }
+
+  html += '</div>';
   document.getElementById('modalBody').innerHTML = html;
 }
 
