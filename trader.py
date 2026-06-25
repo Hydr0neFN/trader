@@ -29,8 +29,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from huggingface_hub import InferenceClient as HFClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -843,6 +843,24 @@ def calc_sim_fees(action: str, qty: int, price: float) -> dict:
     }
 
 
+def open_order_symbols(client: TradingClient) -> set:
+    """Symbols that already have a still-open (unfilled) order. Used to skip
+    re-submitting across cron runs while a prior order is pending — otherwise a
+    second SELL could double-sell into an unintended short, or a second BUY
+    could double the position."""
+    try:
+        orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+        return {o.symbol for o in orders}
+    except Exception as exc:
+        log.warning("Could not fetch open orders (%s) — order-dedup guard disabled this run", exc)
+        return set()
+
+
+def _client_order_id(tag: str, ticker: str) -> str:
+    """Unique, broker-safe client_order_id for idempotency + traceability."""
+    return f"{tag}-{ticker}-{now_et().strftime('%Y%m%d%H%M%S')}"[:128]
+
+
 def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dict:
     """Submit approved orders. Returns {ticker: status} so the caller can label
     decisions.jsonl with what actually happened (EXECUTED vs a SKIP reason vs
@@ -854,6 +872,7 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
 
     positions  = {p.symbol: p for p in client.get_all_positions()}
     open_count = len(positions)
+    pending    = open_order_symbols(client)   # tickers with an unfilled order
     ts         = now_et().isoformat()
 
     status: dict = {}
@@ -869,8 +888,8 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                 log.info("SKIP %s BUY: max open positions (%d) reached", ticker, MAX_POSITIONS)
                 status[ticker] = "SKIPPED_MAX_POS"
                 continue
-            if ticker in positions or ticker in bought:
-                log.info("SKIP %s BUY: position already open / already bought this run", ticker)
+            if ticker in positions or ticker in bought or ticker in pending:
+                log.info("SKIP %s BUY: position open / already bought / order pending", ticker)
                 status[ticker] = "SKIPPED_OPEN"
                 continue
 
@@ -886,6 +905,7 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                     qty=qty,
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
+                    client_order_id=_client_order_id("buy", ticker),
                 ))
                 fees = calc_sim_fees("BUY", qty, price)
                 jsonl_append(LOG_DIR / "executed.jsonl", {
@@ -913,6 +933,10 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                 log.info("SKIP %s SELL: no position held", ticker)
                 status[ticker] = "SKIPPED_NO_POS"
                 continue
+            if ticker in pending:
+                log.info("SKIP %s SELL: an order is already pending", ticker)
+                status[ticker] = "SKIPPED_PENDING"
+                continue
 
             held_qty = int(float(positions[ticker].qty))
             try:
@@ -921,6 +945,7 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                     qty=held_qty,
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY,
+                    client_order_id=_client_order_id("sell", ticker),
                 ))
                 fees = calc_sim_fees("SELL", held_qty, price)
                 jsonl_append(LOG_DIR / "executed.jsonl", {
@@ -1009,10 +1034,14 @@ def check_hard_stops(alpaca: TradingClient, run_ts: str) -> list:
     try:
         positions = alpaca.get_all_positions()
     except Exception as exc:
-        log.error("Could not fetch positions for stop-loss check: %s", exc)
-        return []
+        # FAIL CLOSED: without positions we cannot evaluate stops, so we must not
+        # let the run proceed to open NEW positions on un-risk-checked holdings.
+        # Abort the whole run; the next cron cycle retries.
+        log.critical("Could not fetch positions for stop-loss check: %s — aborting run.", exc)
+        raise
 
-    peaks = load_peaks()
+    peaks   = load_peaks()
+    pending = open_order_symbols(alpaca)   # don't re-submit while a stop is unfilled
     sold_tickers: list = []
 
     for p in positions:
@@ -1034,6 +1063,9 @@ def check_hard_stops(alpaca: TradingClient, run_ts: str) -> list:
         hit_trailing = trailing_armed and drawdown >= TRAIL_STOP_PCT
         if not (hit_hard or hit_trailing):
             continue
+        if ticker in pending:
+            log.info("  %-6s stop triggered but an order is already pending — skipping", ticker)
+            continue
 
         if hit_hard:
             exit_type = "STOP-LOSS"
@@ -1049,6 +1081,7 @@ def check_hard_stops(alpaca: TradingClient, run_ts: str) -> list:
                 qty=qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
+                client_order_id=_client_order_id("stop", ticker),
             ))
             fees = calc_sim_fees("SELL", qty, current)
             jsonl_append(LOG_DIR / "executed.jsonl", {
@@ -1102,6 +1135,7 @@ def run_ai_exits(
     if not positions:
         return [], []
 
+    pending = open_order_symbols(alpaca)
     sold_tickers:   list = []
     exit_decisions: list = []
     hard_stopped = hard_stopped or set()
@@ -1113,6 +1147,9 @@ def run_ai_exits(
         # double-sell — rejected at best, an unintended short at worst.
         if ticker in hard_stopped:
             log.info("  %-6s skipping AI exit — already hard-stopped this run", ticker)
+            continue
+        if ticker in pending:
+            log.info("  %-6s skipping AI exit — an order is already pending", ticker)
             continue
         current   = float(p.current_price)
         avg_entry = float(p.avg_entry_price)
@@ -1217,6 +1254,7 @@ def run_ai_exits(
                 qty=sell_qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
+                client_order_id=_client_order_id("aiexit", ticker),
             ))
             fees = calc_sim_fees("SELL", sell_qty, current)
             jsonl_append(LOG_DIR / "executed.jsonl", {
