@@ -24,6 +24,7 @@
           <th class="text-end">Qty</th>
           <th class="text-end">Avg Entry</th>
           <th class="text-end">Current</th>
+          <th class="text-center">Trend 7d</th>
           <th class="text-end">Market Value</th>
           <th class="text-end" style="min-width:120px;">Allocation</th>
           <th class="text-end pe-3">Unrealized P&amp;L</th>
@@ -41,6 +42,7 @@
           <td class="text-end mono">{{ r.qty | int }}</td>
           <td class="text-end mono">{{ r.avg_entry | fmt_currency }}</td>
           <td class="text-end mono">{{ r.current | fmt_currency }}</td>
+          <td class="text-center"><span class="spark" data-pts="{{ r.spark | join(',') }}" data-up="{% if r.unreal_pl >= 0 %}1{% else %}0{% endif %}"></span></td>
           <td class="text-end mono">{{ r.market_value | fmt_currency }}</td>
           <td class="text-end">
             <div class="d-flex align-items-center justify-content-end gap-2">
@@ -63,4 +65,17 @@
   </div>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.spark').forEach(el => {
+  const pts = (el.dataset.pts || '').split(',').map(Number).filter(n => !isNaN(n));
+  if (pts.length < 2) { el.textContent = '—'; el.classList.add('text-secondary'); return; }
+  const w = 64, h = 20, min = Math.min(...pts), max = Math.max(...pts), span = (max - min) || 1;
+  const d = pts.map((v, i) => `${(i/(pts.length-1)*w).toFixed(1)},${(h-2-(v-min)/span*(h-4)).toFixed(1)}`).join(' ');
+  const col = el.dataset.up === '1' ? '#3fb950' : '#f85149';
+  el.innerHTML = `<svg width="${w}" height="${h}"><polyline fill="none" stroke="${col}" stroke-width="1.5" points="${d}"/></svg>`;
+});
+</script>
 {% endblock %}

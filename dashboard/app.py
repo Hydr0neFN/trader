@@ -8,8 +8,14 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from flask import Flask, render_template, request
 from alpaca.trading.client import TradingClient
+import yfinance as yf
 
 load_dotenv(Path.home() / ".env")
+
+# Cap hung network calls (Alpaca, yfinance sparklines) so a stuck socket can't
+# wedge a gunicorn worker past its timeout.
+import socket as _socket
+_socket.setdefaulttimeout(20)
 
 # Read credentials defensively: a missing ~/.env should surface a clear message
 # (in the route error banner) rather than a bare KeyError worker-boot crash.
@@ -118,6 +124,28 @@ app.jinja_env.filters["fmt_currency"] = fmt_currency
 app.jinja_env.filters["fmt_pct"]      = fmt_pct
 
 
+def _sparklines(symbols: list) -> dict:
+    """Last ~7 daily closes per symbol for inline sparklines. Best-effort: a
+    yfinance hiccup returns {} so the table still renders. Cached by the caller
+    (30 min) so this network hit is rare; socket default-timeout caps any hang."""
+    if not symbols:
+        return {}
+    try:
+        data  = yf.download(symbols, period="7d", interval="1d",
+                            progress=False, threads=False)
+        close = data["Close"]
+        out: dict = {}
+        for s in symbols:
+            try:
+                series = close[s] if len(symbols) > 1 else close
+                out[s] = [round(float(x), 2) for x in series.dropna().tolist()][-7:]
+            except Exception:
+                out[s] = []
+        return out
+    except Exception:
+        return {}
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -214,6 +242,10 @@ def positions():
                 # Portfolio weight — share of total equity in this position.
                 "allocation":   (mv / port_val * 100) if port_val else 0.0,
             })
+        syms   = [r["symbol"] for r in rows]
+        sparks = cached("sparklines_" + ",".join(sorted(syms)), 1800, lambda: _sparklines(syms))
+        for r in rows:
+            r["spark"] = sparks.get(r["symbol"], [])
     except Exception as exc:
         error = str(exc)
 

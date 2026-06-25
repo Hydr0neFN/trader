@@ -37,6 +37,11 @@ from huggingface_hub import InferenceClient as HFClient
 
 load_dotenv(Path.home() / ".env")
 
+# Cap any hung network call (Alpaca / yfinance / HF) process-wide so a stuck
+# socket can't wedge the run and hold the cron flock indefinitely.
+import socket as _socket
+_socket.setdefaulttimeout(30)
+
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 GEMINI_API_KEY    = os.environ["GEMINI_API_KEY"]
