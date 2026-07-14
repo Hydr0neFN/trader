@@ -355,6 +355,19 @@ def run_analyst(data_blocks: list, batch_label: str = "") -> tuple:
     last_exc = None
     pfx = f"[{batch_label}] " if batch_label else ""
 
+    # ── Optional agy path (subscription quota) — falls back to the API chain ──
+    if USE_AGY_GEMINI:
+        try:
+            raw  = call_agy(ANALYST_SYSTEM, "\n\n".join(data_blocks))
+            recs = json.loads(strip_json_fences(raw))
+            if isinstance(recs, dict):
+                recs = [recs]
+            log.info("%sAnalyst using agy: %s (%d recs)", pfx, AGY_MODEL, len(recs))
+            return recs, f"agy:{AGY_MODEL}"
+        except Exception as exc:
+            log.warning("%sagy analyst failed (%s) — falling back to Gemini API…",
+                        pfx, str(exc)[:120])
+
     for model in GEMINI_MODEL_PRIORITY:
         try:
             def call(m=model):
@@ -673,6 +686,15 @@ GEMINI_CLI_TIMEOUT    = int(os.environ.get("GEMINI_CLI_TIMEOUT", "60"))
 # **API** by default. Set USE_GEMINI_EXIT_CLI=1 only with a paid-key-backed CLI.
 USE_GEMINI_EXIT_CLI   = os.environ.get("USE_GEMINI_EXIT_CLI", "0").lower() in ("1", "true", "yes")
 
+# Antigravity CLI (agy): routes Gemini prompts through the local Google sign-in
+# **subscription** quota (~1500 req/day) instead of the metered/free-tier Gemini
+# API key, sidestepping the free-tier 429s. When USE_AGY_GEMINI=1 the analyst and
+# exit analyst try agy first and fall back to the Gemini API chain on any failure.
+AGY_BIN        = os.environ.get("AGY_BIN", str(Path.home() / ".local" / "bin" / "agy"))
+AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.5 Flash (Medium)")
+AGY_TIMEOUT    = int(os.environ.get("AGY_TIMEOUT", "120"))
+USE_AGY_GEMINI = os.environ.get("USE_AGY_GEMINI", "0").lower() in ("1", "true", "yes")
+
 
 def call_gemini_cli(system_prompt: str, user_prompt: str, model):
     """Call the local gemini CLI in headless mode.
@@ -716,6 +738,33 @@ def call_gemini_cli(system_prompt: str, user_prompt: str, model):
     raise RuntimeError(f"All CLI models failed: {last_exc}")
 
 
+def call_agy(system_prompt: str, user_prompt: str) -> str:
+    """Run a prompt through the Antigravity CLI (agy) in headless print mode.
+
+    Uses the local Google sign-in subscription quota rather than metered Gemini
+    API tokens. `agy -p` prints the model's reply to stdout; with a JSON-only
+    system prompt it returns parseable JSON directly.
+
+    Returns:
+        str: raw stdout (expected JSON per the system prompt).
+    Raises:
+        RuntimeError: on non-zero exit or empty output.
+    """
+    full_prompt = f"{system_prompt}\n\n{user_prompt}"
+    proc = subprocess.run(
+        [AGY_BIN, "--model", AGY_MODEL, "-p", full_prompt],
+        capture_output=True,
+        text=True,
+        timeout=AGY_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"agy exit {proc.returncode}: {proc.stderr[-160:]}")
+    out = proc.stdout.strip()
+    if not out:
+        raise RuntimeError("agy empty response")
+    return out
+
+
 def run_exit_analyst(position_context: str, batch_label: str = "") -> dict:
     """Call Gemini to decide HOLD / TRIM / EXIT for one position.
 
@@ -727,6 +776,25 @@ def run_exit_analyst(position_context: str, batch_label: str = "") -> dict:
     Returns dict with action, confidence, reasoning, model.
     """
     pfx = f"[{batch_label}] " if batch_label else ""
+
+    # ── Optional agy path (subscription quota) — falls back to CLI/API below ──
+    if USE_AGY_GEMINI:
+        try:
+            raw    = call_agy(EXIT_ANALYST_SYSTEM, position_context)
+            data   = json.loads(strip_json_fences(raw))
+            action = data.get("action", "HOLD").upper()
+            if action not in ("HOLD", "TRIM", "EXIT"):
+                action = "HOLD"
+            log.info("%sExit analyst using agy: %s", pfx, AGY_MODEL)
+            return {
+                "action":     action,
+                "confidence": int(data.get("confidence", 0)),
+                "reasoning":  data.get("reasoning", ""),
+                "model":      f"agy:{AGY_MODEL}",
+            }
+        except Exception as exc:
+            log.warning("%sagy exit analyst failed (%s) — falling back…",
+                        pfx, str(exc)[:120])
 
     # ── Optional CLI path (off by default; see USE_GEMINI_EXIT_CLI). The Gemini
     #    API chain below is the primary path. ──
