@@ -1,3 +1,5 @@
+**English** · [繁體中文](README.zh-TW.md)
+
 # trader
 
 Multi-LLM algorithmic **paper-trading** system for US equities. Runs on a cron
