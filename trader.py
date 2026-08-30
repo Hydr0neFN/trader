@@ -333,15 +333,17 @@ ANALYST_SYSTEM = (
     "Base analysis SOLELY on technical/price data when headlines are absent."
 )
 
+# Tried in order — best quality first. 429 = quota/paid-wall (skip), 404 = missing
+# (skip), 503 = temporary overload (one retry then skip to next).
 # Verified against the live free-tier model list and quota dashboard on
 # 2026-08-30. Dropped: gemini-3.1-pro-preview, gemini-3-pro-preview and
 # gemini-2.5-pro all report quotaValue 0 on the free tier, and the -preview
-# suffix on 3.1-flash-lite no longer resolves -- four wasted round trips before
-# the chain reached anything that could answer. Ordered by measured answer
-# quality, with flash-lite last because it is much weaker but carries 500 RPD
-# against every other entry's 20, making it the capacity backstop.
+# suffix on 3.1-flash-lite no longer resolves -- four wasted round trips
+# before the chain reached anything that could answer. Ordered by measured
+# answer quality, with flash-lite last because it is much weaker but carries
+# 500 RPD against every other entry's 20 and so is the capacity backstop.
 GEMINI_MODEL_PRIORITY = [
-    "gemini-3.6-flash",             # answers reliably on the free tier
+    "gemini-3.6-flash",             # best measured; answers reliably on free tier
     "gemini-3.7-flash",             # equal quality, but often "high demand" here
     "gemini-3.5-flash",             # previous chain head
     "gemini-3-flash-preview",
@@ -501,6 +503,72 @@ _SDK_MAX_FAILS = 3
 # Haiku. Set CLAUDE_SDK_FOR=all to route every Claude call through Sonnet.
 CLAUDE_SDK_FOR = os.environ.get("CLAUDE_SDK_FOR", "exits").lower()
 
+# Quota valve for the LLM exit analyst. Off by default. When on, positions
+# trading at or above their MA5 skip the LLM review and are held. Measured on
+# 19,654 historical reviews: -65% LLM calls, retains 73% of executed exits.
+# Turn this on when subscription quota is the binding constraint, not before.
+EXIT_GATE = os.environ.get("EXIT_GATE", "0") == "1"
+
+# ── Per-call LLM cost logging ─────────────────────────────────────────────
+#
+# Anthropic API pricing, USD per MTok (million tokens). Verified against
+# https://platform.claude.com/docs/en/about-claude/pricing on 2026-08-15.
+# "cache_write_5m" is the rate for the ephemeral 5-minute cache_control block
+# _claude_via_api sets on the system prompt (the only cache TTL this file
+# uses); "cache_read" is a hit against that cache. Rates change over time —
+# update this dict, and only this dict, when Anthropic republishes pricing.
+CLAUDE_PRICES = {
+    "claude-haiku-4-5-20251001": {
+        "input":          1.00,   # $/MTok, base (uncached) input
+        "output":         5.00,   # $/MTok
+        "cache_write_5m": 1.25,   # $/MTok, 5-minute ephemeral cache write
+        "cache_read":     0.10,   # $/MTok, cache hit
+    },
+}
+
+
+def _claude_cost_usd(model: str, input_tokens, output_tokens,
+                      cache_creation_input_tokens, cache_read_input_tokens):
+    """USD cost of one metered call from its token counts, or None if `model`
+    has no entry in CLAUDE_PRICES (unpriced rather than silently wrong)."""
+    rates = CLAUDE_PRICES.get(model)
+    if rates is None:
+        return None
+    return round(
+        (input_tokens or 0)                  / 1_000_000 * rates["input"]
+        + (output_tokens or 0)               / 1_000_000 * rates["output"]
+        + (cache_creation_input_tokens or 0) / 1_000_000 * rates["cache_write_5m"]
+        + (cache_read_input_tokens or 0)     / 1_000_000 * rates["cache_read"],
+        6,
+    )
+
+
+def _log_llm_call(*, model: str, path: str, call_type: str, label: str,
+                   latency_ms: float, input_tokens=None, output_tokens=None,
+                   cache_creation_input_tokens=None, cache_read_input_tokens=None,
+                   cost_usd=None, billing: str = "metered", error=None) -> None:
+    """Append one record to llm_calls.jsonl. Fail-safe by design: a logging
+    error must never break a trading run, so any failure here is swallowed
+    (after a warning) rather than propagated to the caller."""
+    try:
+        jsonl_append(LOG_DIR / "llm_calls.jsonl", {
+            "timestamp":                   now_et().isoformat(),
+            "model":                       model,
+            "path":                        path,          # "haiku-api" | "sonnet-sdk"
+            "call_type":                   call_type,      # "buy" | "exit"
+            "ticker":                      label,
+            "latency_ms":                  round(latency_ms, 1),
+            "input_tokens":                input_tokens,
+            "output_tokens":               output_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "cache_read_input_tokens":     cache_read_input_tokens,
+            "cost_usd":                    cost_usd,       # 0.0 for subscription calls
+            "billing":                     billing,        # "metered" | "subscription"
+            "error":                       error,
+        })
+    except Exception as exc:
+        log.warning("llm_calls.jsonl logging failed (non-fatal): %s", exc)
+
 
 def _sdk_allowed_for(call_type: str) -> bool:
     if CLAUDE_SDK_FOR == "all":
@@ -518,7 +586,7 @@ def _claude_use_sdk() -> bool:
     )
 
 
-def _claude_via_sdk(system: str, user: str) -> tuple:
+def _claude_via_sdk(system: str, user: str, call_type: str = "exit", label: str = "") -> tuple:
     """One-shot Claude Sonnet call via the `claude` CLI (subscription auth).
 
     Runs from /tmp with ANTHROPIC_API_KEY stripped so the CLI uses the OAuth
@@ -528,37 +596,85 @@ def _claude_via_sdk(system: str, user: str) -> tuple:
     """
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     env["CLAUDE_CODE_OAUTH_TOKEN"] = CLAUDE_OAUTH_TOKEN
-    proc = subprocess.run(
-        [CLAUDE_CLI_PATH, "-p", user,
-         "--model", CLAUDE_SDK_MODEL,
-         "--system-prompt", _SDK_HARDENING + system,
-         "--output-format", "json",
-         "--max-turns", "1",
-         "--allowedTools", "",
-         "--strict-mcp-config",
-         "--no-session-persistence",
-         "--permission-mode", "default"],
-        capture_output=True, text=True, timeout=CLAUDE_SDK_TIMEOUT, cwd="/tmp", env=env,
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            [CLAUDE_CLI_PATH, "-p", user,
+             "--model", CLAUDE_SDK_MODEL,
+             "--system-prompt", _SDK_HARDENING + system,
+             "--output-format", "json",
+             "--max-turns", "1",
+             "--allowedTools", "",
+             "--strict-mcp-config",
+             "--no-session-persistence",
+             "--permission-mode", "default"],
+            capture_output=True, text=True, timeout=CLAUDE_SDK_TIMEOUT, cwd="/tmp", env=env,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"claude exit {proc.returncode}: {proc.stderr[-200:]}")
+        payload = json.loads(proc.stdout)
+        if payload.get("is_error") or payload.get("subtype") != "success":
+            raise RuntimeError(f"claude error: {str(payload.get('result'))[:200]}")
+        text = (payload.get("result") or "").strip()
+        if not text:
+            raise RuntimeError("claude empty result")
+    except Exception as exc:
+        # SDK calls bill the subscription, never metered $ — cost_usd stays
+        # 0.0 even on failure so this can never be mistaken for API spend.
+        _log_llm_call(
+            model=CLAUDE_SDK_MODEL, path="sonnet-sdk", call_type=call_type, label=label,
+            latency_ms=(time.time() - start) * 1000,
+            cost_usd=0.0, billing="subscription", error=str(exc)[:300],
+        )
+        raise
+
+    # The CLI's --output-format json result carries an aggregate `usage`
+    # block when available; older/other CLI builds may omit it entirely, in
+    # which case we log null token counts rather than guess.
+    usage = payload.get("usage") or {}
+    _log_llm_call(
+        model=CLAUDE_SDK_MODEL, path="sonnet-sdk", call_type=call_type, label=label,
+        latency_ms=(time.time() - start) * 1000,
+        input_tokens=usage.get("input_tokens"),
+        output_tokens=usage.get("output_tokens"),
+        cache_creation_input_tokens=usage.get("cache_creation_input_tokens"),
+        cache_read_input_tokens=usage.get("cache_read_input_tokens"),
+        cost_usd=0.0, billing="subscription",
     )
-    if proc.returncode != 0:
-        raise RuntimeError(f"claude exit {proc.returncode}: {proc.stderr[-200:]}")
-    payload = json.loads(proc.stdout)
-    if payload.get("is_error") or payload.get("subtype") != "success":
-        raise RuntimeError(f"claude error: {str(payload.get('result'))[:200]}")
-    text = (payload.get("result") or "").strip()
-    if not text:
-        raise RuntimeError("claude empty result")
     return text
 
 
-def _claude_via_api(system: str, user: str, max_tokens: int) -> str:
+def _claude_via_api(system: str, user: str, max_tokens: int,
+                     call_type: str = "exit", label: str = "") -> str:
     """Metered Anthropic API call on Haiku (fallback path)."""
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg = client.messages.create(
-        model=CLAUDE_API_MODEL,
-        max_tokens=max_tokens,
-        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user}],
+    start = time.time()
+    try:
+        msg = client.messages.create(
+            model=CLAUDE_API_MODEL,
+            max_tokens=max_tokens,
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception as exc:
+        _log_llm_call(
+            model=CLAUDE_API_MODEL, path="haiku-api", call_type=call_type, label=label,
+            latency_ms=(time.time() - start) * 1000,
+            billing="metered", error=str(exc)[:300],
+        )
+        raise
+
+    usage = msg.usage
+    cache_creation = getattr(usage, "cache_creation_input_tokens", None)
+    cache_read     = getattr(usage, "cache_read_input_tokens", None)
+    cost = _claude_cost_usd(CLAUDE_API_MODEL, usage.input_tokens, usage.output_tokens,
+                             cache_creation, cache_read)
+    _log_llm_call(
+        model=CLAUDE_API_MODEL, path="haiku-api", call_type=call_type, label=label,
+        latency_ms=(time.time() - start) * 1000,
+        input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+        cache_creation_input_tokens=cache_creation, cache_read_input_tokens=cache_read,
+        cost_usd=cost, billing="metered",
     )
     return msg.content[0].text.strip()
 
@@ -574,7 +690,7 @@ def claude_complete(system: str, user: str, max_tokens: int, label: str = "",
     """
     if _sdk_allowed_for(call_type) and _claude_use_sdk():
         try:
-            text = _claude_via_sdk(system, user)
+            text = _claude_via_sdk(system, user, call_type=call_type, label=label)
             _sdk_state["fails"] = 0
             return text, "sonnet-sdk"
         except Exception as exc:
@@ -585,7 +701,7 @@ def claude_complete(system: str, user: str, max_tokens: int, label: str = "",
                 _sdk_state["off"] = True
                 log.warning("Claude SDK disabled for the rest of this run after %d failures",
                             _SDK_MAX_FAILS)
-    return _claude_via_api(system, user, max_tokens), "haiku-api"
+    return _claude_via_api(system, user, max_tokens, call_type=call_type, label=label), "haiku-api"
 
 
 # ── Step 3: Risk Manager — Claude Haiku ──────────────────────────────────────
@@ -677,7 +793,7 @@ GEMINI_CLI_PATH       = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
 # exhausts the loop drops to Flash on the next iteration. Override via
 # GEMINI_CLI_EXIT_MODELS env (comma-separated). Singular GEMINI_CLI_EXIT_MODEL
 # is honoured for backward compat (becomes the head of the chain).
-_default_cli_chain = "gemini-3.6-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-2.5-flash"
+_default_cli_chain = "gemini-3.5-flash,gemini-3.1-pro-preview,gemini-3-pro-preview,gemini-3-flash-preview,gemini-2.5-flash"
 _legacy_single = os.environ.get("GEMINI_CLI_EXIT_MODEL")
 GEMINI_CLI_EXIT_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_CLI_EXIT_MODELS", _legacy_single or _default_cli_chain).split(",")
@@ -691,18 +807,20 @@ GEMINI_CLI_TIMEOUT    = int(os.environ.get("GEMINI_CLI_TIMEOUT", "60"))
 USE_GEMINI_EXIT_CLI   = os.environ.get("USE_GEMINI_EXIT_CLI", "0").lower() in ("1", "true", "yes")
 
 # Antigravity CLI (agy): routes Gemini prompts through the local Google sign-in
-# **subscription** quota (~1500 req/day) instead of the metered/free-tier Gemini
-# API key, sidestepping the free-tier 429s. When USE_AGY_GEMINI=1 the analyst and
-# exit analyst try agy first and fall back to the Gemini API chain on any failure.
+# **subscription** quota instead of the metered/free-tier Gemini API key,
+# sidestepping the free tier's 20 requests/day per model. That quota is not a
+# daily request allowance -- it meters compute and resets weekly; exhausting it
+# returns "Individual quota reached ... Resets in 167h55m45s", i.e. a 7-day
+# lockout with no intra-day refill on the AI Plus tier. When USE_AGY_GEMINI=1 the
+# analyst and exit analyst try agy first and fall back to the Gemini API chain.
 AGY_BIN        = os.environ.get("AGY_BIN", str(Path.home() / ".local" / "bin" / "agy"))
-# Default is 3.6 Flash (High) as of 2026-08-30. A benchmark with computed
-# ground truth found 3.6 and 3.7 Flash indistinguishable on this kind of work
-# and both well ahead of 3.5. 3.6 wins the tie on availability: on the Gemini
-# free tier -- where this bot lands whenever agy fails -- 3.6 answers every
-# call while 3.7 mostly returns "high demand", so primary and fallback paths
-# now run the same model. Override with AGY_MODEL in .env. If subscription
-# quota gets tight, drop to "(Medium)" before changing generation; the effort
-# tier costs more than the generation does.
+# Default is 3.6 Flash (High) as of 2026-08-30. A benchmark with computed ground
+# truth found 3.6 and 3.7 Flash indistinguishable on this kind of work and both
+# well ahead of 3.5, so the tie breaks on availability: on the Gemini free tier --
+# where this bot lands whenever agy fails -- 3.6 answers every call while 3.7
+# mostly returns "high demand", so primary and fallback now run the same model.
+# If subscription quota gets tight, drop to "(Medium)" before changing generation;
+# the effort tier costs more than the generation does.
 AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.6 Flash (High)")
 AGY_TIMEOUT    = int(os.environ.get("AGY_TIMEOUT", "120"))
 USE_AGY_GEMINI = os.environ.get("USE_AGY_GEMINI", "0").lower() in ("1", "true", "yes")
@@ -1268,6 +1386,34 @@ def run_ai_exits(
         log.info("  %-6s  P&L=%+.2f%%  days=%s — running AI exit review…",
                  ticker, plpc, days_held)
 
+        # Quota valve (EXIT_GATE=1): skip the LLM for positions that are not
+        # near a decision boundary. Fails open when market data is unusable.
+        if EXIT_GATE:
+            gated = False
+            try:
+                gated = float(mdata["current_price"]) >= float(mdata["ma5"])
+            except (KeyError, TypeError, ValueError):
+                gated = False
+            if gated:
+                log.info("  %-6s  exit gate: at/above MA5 — LLM review skipped", ticker)
+                exit_decisions.append({
+                    "decision_type":          "exit_review",
+                    "ticker":                 ticker,
+                    "entry_price":            avg_entry,
+                    "current_price":          current,
+                    "unrealized_plpc":        round(plpc, 2),
+                    "days_held":              days_held,
+                    "gemini_exit_action":     "HOLD",
+                    "gemini_exit_confidence": 0,
+                    "gemini_exit_reasoning":  "gated: price at/above MA5, no LLM review",
+                    "gemini_exit_model":      "gate",
+                    "position_context":       position_context,
+                    "haiku_exit_verdict":     "N/A",
+                    "haiku_exit_justification": "",
+                    "final_exit_action":      "HELD",
+                })
+                continue
+
         # Gemini exit analyst
         exit_rec = run_exit_analyst(position_context, batch_label=ticker)
         api_calls["exit_gemini"] = api_calls.get("exit_gemini", 0) + 1
@@ -1292,6 +1438,7 @@ def run_ai_exits(
                 "gemini_exit_confidence": exit_confidence,
                 "gemini_exit_reasoning":  exit_reasoning,
                 "gemini_exit_model":      exit_rec.get("model", ""),
+                "position_context":       position_context,
                 "haiku_exit_verdict":     "N/A",
                 "haiku_exit_justification": "",
                 "final_exit_action":      "HELD",
@@ -1316,6 +1463,7 @@ def run_ai_exits(
             "gemini_exit_confidence":   exit_confidence,
             "gemini_exit_reasoning":    exit_reasoning,
             "gemini_exit_model":        exit_rec.get("model", ""),
+            "position_context":         position_context,
             "haiku_exit_verdict":       haiku_verdict,
             "haiku_exit_justification": haiku_just,
         }
@@ -1510,6 +1658,31 @@ def main() -> None:
     vetoed_count    = 0
     decisions: dict = {}
 
+    # Snapshot of slot/position state as of the start of this run, used by the
+    # pre-Haiku gate below to skip the metered Claude call for candidates that
+    # cannot possibly be executed (Step 4 would reject them with SKIPPED_MAX_POS
+    # / SKIPPED_OPEN / SKIPPED_NO_POS regardless of what Haiku says). This is a
+    # *separate* fetch from the one execute_trades makes for the real order
+    # submission — that one stays authoritative; this one only decides whether
+    # to spend a Haiku call. If the fetch fails, disable the pre-check for this
+    # run rather than guess, so we fall back to today's exact behaviour.
+    try:
+        run_start_positions = {p.symbol: p for p in alpaca.get_all_positions()}
+        run_start_pending   = open_order_symbols(alpaca)
+        pre_check_enabled   = True
+    except Exception as exc:
+        log.warning("Pre-Haiku gate disabled this run — position snapshot failed: %s", exc)
+        run_start_positions = {}
+        run_start_pending   = set()
+        pre_check_enabled   = False
+    # Running count of positions that will be open once every BUY approved so
+    # far *in this run* executes — starts at the pre-run count and increments
+    # each time a candidate clears the gate (mirrors execute_trades' own
+    # open_count, just computed ahead of time). Must be a running count, not a
+    # stale snapshot: a slot consumed by an earlier candidate in this same run
+    # has to reduce room for a later one.
+    running_open_count = len(run_start_positions)
+
     NEWS_REFERENCE_KEYWORDS = (
         "report", "announce", "launch", "release", "beat", "miss", "surge",
         "plunge", "jump", "drop", "fell", "rose", "gain", "loss", "revenue",
@@ -1610,6 +1783,36 @@ def main() -> None:
             })
             continue
 
+        # 3a-pre. Pre-Haiku gate — cheap, deterministic, no Claude call.
+        # Skip the metered Haiku review entirely when this candidate cannot
+        # possibly be traded this run: slot / position state is knowable
+        # up front and doesn't depend on Haiku's verdict. Same skip labels
+        # execute_trades would assign later, so audit continuity holds.
+        pre_skip = None
+        if pre_check_enabled:
+            if action == "BUY":
+                if running_open_count >= MAX_POSITIONS:
+                    pre_skip = "SKIPPED_MAX_POS"
+                elif ticker in run_start_positions or ticker in run_start_pending:
+                    pre_skip = "SKIPPED_OPEN"
+            elif action == "SELL":
+                if ticker not in run_start_positions:
+                    pre_skip = "SKIPPED_NO_POS"
+
+        if pre_skip:
+            log.info("  %-6s pre-skip %s — Haiku call skipped", ticker, pre_skip)
+            decisions[ticker] = {
+                "haiku_verdict":       "NOT_CALLED",
+                "haiku_justification": "",
+                "hf_sentiment":        hf.get("sentiment", "NEUTRAL"),
+                "hf_confidence":       hf.get("confidence"),
+                "hf_reasoning":        hf.get("reasoning", ""),
+                "hf_model":            hf.get("model", ""),
+                "final_action":        pre_skip,
+                "gemini_batch":        ticker_batch.get(ticker),
+            }
+            continue
+
         # 3b. Haiku risk review
         haiku_input   = build_data_block(data_map[ticker], headlines_map.get(ticker, []))
         haiku_preview = (
@@ -1671,6 +1874,14 @@ def main() -> None:
         else:
             decisions[ticker] = {**dec_base, "final_action": f"{action}_PENDING"}
             approved_trades.append(rec)
+            # Mirror execute_trades' own open_count += 1 / -= 1 (:1105/:1145)
+            # so a later candidate in this same run sees accurate remaining
+            # capacity — an approved SELL earlier in the run frees a slot a
+            # later BUY can fill, exactly as execute_trades allows today.
+            if action == "BUY":
+                running_open_count += 1
+            elif action == "SELL":
+                running_open_count = max(0, running_open_count - 1)
 
     # ── Step 4: Execution ─────────────────────────────────────────────────
     log.info("Step 4: Executing %d approved trade(s)…", len(approved_trades))
