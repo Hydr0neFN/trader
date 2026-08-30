@@ -11,7 +11,7 @@
 每次執行（平日 9:30–16:00 ET，每 30 分鐘一次）針對每批股票代碼執行以下流程：
 
 1. **市場數據 + 新聞** — 透過 yfinance 取得價格歷史，透過 Alpaca 新聞 API 取得新聞標題。
-2. **分析師**（Gemini）— 附帶信心度與理由的 BUY/SELL/HOLD 建議。沿著模型優先順序鏈（`gemini-3.5-flash` → `gemini-3.1-pro` → … → `gemini-2.5-flash`）依序嘗試，以便在某個模型遇到額度限制時能平穩降級。
+2. **分析師**（Gemini）— 附帶信心度與理由的 BUY/SELL/HOLD 建議。沿著模型優先順序鏈（`gemini-3.6-flash` → `gemini-3.7-flash` → … → `gemini-3.1-flash-lite`）依序嘗試，以便在某個模型遇到額度限制時能平穩降級。
 3. **情緒分析**（Hugging Face）— BULLISH/BEARISH/NEUTRAL 的第二意見。僅在與分析師**直接衝突**時（BUY 對上 BEARISH，或 SELL 對上 BULLISH）才會阻擋交易；NEUTRAL（無重大新聞／空白新聞）不會行使否決權。
 4. **風險控管**（Claude）— 最終關卡；否決不安全的交易。在關鍵的出場決策上透過 Claude Agent SDK 使用 **Sonnet** — 運用您 **Claude Pro 方案內含額度** — 並使用 **Haiku** API 進行大批量的買入篩選；未設定訂閱 token 時會退回使用 Haiku。
 5. **執行** — Alpaca 模擬訂單；強制停損底線**與保護利潤的移動停損**皆獨立於 LLM 強制執行。

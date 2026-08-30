@@ -15,8 +15,8 @@ Each run (every 30 min, 9:30–16:00 ET, weekdays) executes a pipeline per ticke
 
 1. **Market data + news** — price history via yfinance, headlines via Alpaca news API.
 2. **Analyst** (Gemini) — BUY/SELL/HOLD recommendation with confidence + reasoning.
-   Walks a model-priority chain (`gemini-3.5-flash` → `gemini-3.1-pro` → … →
-   `gemini-2.5-flash`) so it degrades gracefully when a model is quota-gated.
+   Walks a model-priority chain (`gemini-3.6-flash` → `gemini-3.7-flash` → … →
+   `gemini-3.1-flash-lite`) so it degrades gracefully when a model is quota-gated.
 3. **Sentiment** (Hugging Face) — BULLISH/BEARISH/NEUTRAL second opinion. It only
    blocks a trade when it **directly contradicts** the analyst (BUY vs BEARISH, or
    SELL vs BULLISH); NEUTRAL (quiet/empty news) does not veto.

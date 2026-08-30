@@ -333,16 +333,20 @@ ANALYST_SYSTEM = (
     "Base analysis SOLELY on technical/price data when headlines are absent."
 )
 
-# Tried in order — best quality first. 429 = quota/paid-wall (skip), 404 = missing
-# (skip), 503 = temporary overload (one retry then skip to next).
+# Verified against the live free-tier model list and quota dashboard on
+# 2026-08-30. Dropped: gemini-3.1-pro-preview, gemini-3-pro-preview and
+# gemini-2.5-pro all report quotaValue 0 on the free tier, and the -preview
+# suffix on 3.1-flash-lite no longer resolves -- four wasted round trips before
+# the chain reached anything that could answer. Ordered by measured answer
+# quality, with flash-lite last because it is much weaker but carries 500 RPD
+# against every other entry's 20, making it the capacity backstop.
 GEMINI_MODEL_PRIORITY = [
-    "gemini-3.5-flash",             # newest — priority for API fallback
-    "gemini-3.1-pro-preview",       # may be quota-gated on free tier
-    "gemini-3-pro-preview",         # Gemini 3 Pro
-    "gemini-3.1-flash-lite-preview", # 3.1 Flash — free tier, sometimes overloaded
-    "gemini-3-flash-preview",       # Gemini 3 Flash — confirmed free tier
-    "gemini-2.5-pro",               # 2.5 Pro fallback
-    "gemini-2.5-flash",             # final fallback — always available on free tier
+    "gemini-3.6-flash",             # answers reliably on the free tier
+    "gemini-3.7-flash",             # equal quality, but often "high demand" here
+    "gemini-3.5-flash",             # previous chain head
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite",        # 500 RPD -- last resort, weakest of the set
 ]
 
 
@@ -673,7 +677,7 @@ GEMINI_CLI_PATH       = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
 # exhausts the loop drops to Flash on the next iteration. Override via
 # GEMINI_CLI_EXIT_MODELS env (comma-separated). Singular GEMINI_CLI_EXIT_MODEL
 # is honoured for backward compat (becomes the head of the chain).
-_default_cli_chain = "gemini-3.5-flash,gemini-3.1-pro-preview,gemini-3-pro-preview,gemini-3-flash-preview,gemini-2.5-flash"
+_default_cli_chain = "gemini-3.6-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-2.5-flash"
 _legacy_single = os.environ.get("GEMINI_CLI_EXIT_MODEL")
 GEMINI_CLI_EXIT_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_CLI_EXIT_MODELS", _legacy_single or _default_cli_chain).split(",")
@@ -691,14 +695,15 @@ USE_GEMINI_EXIT_CLI   = os.environ.get("USE_GEMINI_EXIT_CLI", "0").lower() in ("
 # API key, sidestepping the free-tier 429s. When USE_AGY_GEMINI=1 the analyst and
 # exit analyst try agy first and fall back to the Gemini API chain on any failure.
 AGY_BIN        = os.environ.get("AGY_BIN", str(Path.home() / ".local" / "bin" / "agy"))
-# Default raised from 3.5 Flash (Medium) on 2026-08-30. A task benchmark run on
-# this account found 3.7 and 3.6 Flash indistinguishable from each other and well
-# ahead of 3.5, and 3.7 is the cheaper of the two per token while the launch
-# promotion lasts -- which matters because this bot shares one subscription quota
-# with everything else on the account. Override with AGY_MODEL in .env; drop to
-# "(Medium)" first if quota gets tight, the effort tier costs more than the
-# generation does.
-AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.7 Flash (High)")
+# Default is 3.6 Flash (High) as of 2026-08-30. A benchmark with computed
+# ground truth found 3.6 and 3.7 Flash indistinguishable on this kind of work
+# and both well ahead of 3.5. 3.6 wins the tie on availability: on the Gemini
+# free tier -- where this bot lands whenever agy fails -- 3.6 answers every
+# call while 3.7 mostly returns "high demand", so primary and fallback paths
+# now run the same model. Override with AGY_MODEL in .env. If subscription
+# quota gets tight, drop to "(Medium)" before changing generation; the effort
+# tier costs more than the generation does.
+AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.6 Flash (High)")
 AGY_TIMEOUT    = int(os.environ.get("AGY_TIMEOUT", "120"))
 USE_AGY_GEMINI = os.environ.get("USE_AGY_GEMINI", "0").lower() in ("1", "true", "yes")
 
