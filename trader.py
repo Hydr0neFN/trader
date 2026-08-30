@@ -691,7 +691,14 @@ USE_GEMINI_EXIT_CLI   = os.environ.get("USE_GEMINI_EXIT_CLI", "0").lower() in ("
 # API key, sidestepping the free-tier 429s. When USE_AGY_GEMINI=1 the analyst and
 # exit analyst try agy first and fall back to the Gemini API chain on any failure.
 AGY_BIN        = os.environ.get("AGY_BIN", str(Path.home() / ".local" / "bin" / "agy"))
-AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.5 Flash (Medium)")
+# Default raised from 3.5 Flash (Medium) on 2026-08-30. A task benchmark run on
+# this account found 3.7 and 3.6 Flash indistinguishable from each other and well
+# ahead of 3.5, and 3.7 is the cheaper of the two per token while the launch
+# promotion lasts -- which matters because this bot shares one subscription quota
+# with everything else on the account. Override with AGY_MODEL in .env; drop to
+# "(Medium)" first if quota gets tight, the effort tier costs more than the
+# generation does.
+AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.7 Flash (High)")
 AGY_TIMEOUT    = int(os.environ.get("AGY_TIMEOUT", "120"))
 USE_AGY_GEMINI = os.environ.get("USE_AGY_GEMINI", "0").lower() in ("1", "true", "yes")
 
