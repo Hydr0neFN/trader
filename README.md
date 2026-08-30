@@ -26,10 +26,15 @@ Each run (every 30 min, 9:30–16:00 ET, weekdays) executes a pipeline per ticke
    falls back to Haiku when no subscription token is configured.
 5. **Execution** — Alpaca paper order; a hard stop-loss floor **and a
    profit-protecting trailing stop** are enforced independently of the LLMs.
-6. **Exit analysis** — open positions are re-evaluated by a separate Gemini **API**
-   exit analyst + a Claude exit-risk gate. (Google retired the individual-tier
-   `gemini-cli` on 2026-06-18; that path is off by default — set
+6. **Exit analysis** — open positions are re-evaluated by a Gemini exit analyst and a
+   Claude exit-risk gate. With `USE_AGY_GEMINI=1` the exit analyst goes through the
+   Antigravity CLI against a Google AI **subscription** and falls back to the Gemini
+   API chain on any failure; otherwise it uses the API chain directly. (Google retired
+   the individual-tier `gemini-cli` on 2026-06-18; that path is off by default — set
    `USE_GEMINI_EXIT_CLI=1` only with a paid-key-backed CLI.)
+
+   Note the asymmetry this creates: a `HOLD` returns before the Claude gate is
+   consulted, so the gate can veto an unwarranted exit but cannot catch a missed one.
 
 A prompt rule forbids the analyst from inventing news when no headlines are supplied —
 absence of data must be stated, not hallucinated.
@@ -68,6 +73,26 @@ included usage** rather than metered Haiku API tokens — add `CLAUDE_CODE_OAUTH
 `none`) and `CLAUDE_SDK_MODEL` (default `sonnet`). With no token the bot runs
 Haiku-only, exactly as before.
 
+**Optional — Gemini via Antigravity subscription.** `USE_AGY_GEMINI=1` routes the
+analyst and exit analyst through the `agy` CLI, drawing on a Google AI subscription
+instead of the Gemini API key. That quota meters compute and resets **weekly**, so
+exhausting it returns a multi-day lockout rather than a next-day reset; any agy
+failure falls back to the API chain automatically. Tunables: `AGY_MODEL` (default
+`Gemini 3.6 Flash (High)`), `AGY_BIN`, `AGY_TIMEOUT`.
+
+**Optional — quota valve.** `EXIT_GATE=1` limits the LLM exit review to positions
+trading below their 5-day moving average. Measured across 19,654 historical reviews
+this removes ~65% of exit-analyst calls while still surfacing 73% of the exits that
+actually executed; it fails open when market data is unusable. Off by default: the
+trade is only worth making when quota, not accuracy, is the binding constraint.
+
+**Cost logging.** Every metered Claude call is appended to
+`trade_logs/llm_calls.jsonl` with model, path, call type, token counts and cost.
+`llm_cost_report.py` summarises it (`--days N` for a per-day breakdown, `--days 0`
+for the whole file). Metered and subscription calls are reported separately and never
+summed. Exit reviews additionally store the exact prompt they were given, so the
+component can be evaluated after the fact rather than reconstructed from other logs.
+
 ## Run
 
 ```bash
@@ -100,6 +125,8 @@ python3 dashboard/app.py
 
 ```
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
+llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
+healthcheck.py         # run-freshness check, notifies via ntfy
 requirements.txt
 dashboard/
   app.py               # Flask dashboard
