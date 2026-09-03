@@ -11,7 +11,7 @@
 每次執行（平日 9:30–16:00 ET，每 30 分鐘一次）針對每批股票代碼執行以下流程：
 
 1. **市場數據 + 新聞** — 透過 yfinance 取得價格歷史，透過 Alpaca 新聞 API 取得新聞標題。
-2. **分析師**（Gemini）— 附帶信心度與理由的 BUY/SELL/HOLD 建議。沿著模型優先順序鏈（`gemini-3.6-flash` → `gemini-3.7-flash` → … → `gemini-3.1-flash-lite`）依序嘗試，以便在某個模型遇到額度限制時能平穩降級。
+2. **分析師**（Gemini）— 附帶信心度與理由的 BUY/SELL/HOLD 建議。沿著模型優先順序鏈（`gemini-3.8-flash` → `gemini-3.6-flash` → … → `gemini-3.1-flash-lite`）依序嘗試，以便在某個模型遇到額度限制時能平穩降級。
 3. **情緒分析**（Hugging Face）— BULLISH/BEARISH/NEUTRAL 的第二意見。僅在與分析師**直接衝突**時（BUY 對上 BEARISH，或 SELL 對上 BULLISH）才會阻擋交易；NEUTRAL（無重大新聞／空白新聞）不會行使否決權。
 4. **風險控管**（Claude）— 最終關卡；否決不安全的交易。在關鍵的出場決策上透過 Claude Agent SDK 使用 **Sonnet** — 運用您 **Claude Pro 方案內含額度** — 並使用 **Haiku** API 進行大批量的買入篩選；未設定訂閱 token 時會退回使用 Haiku。
 5. **執行** — Alpaca 模擬訂單；強制停損底線**與保護利潤的移動停損**皆獨立於 LLM 強制執行。
@@ -45,7 +45,7 @@ cp .env.example ~/.env        # fill in your keys
 
 **選用 — 透過訂閱使用 Claude Sonnet。** 若要透過 Claude Agent SDK 在 Claude **Sonnet** 上執行風險／出場關卡 — 運用您的 **Claude Pro 方案內含額度**而非按用量計費的 Haiku API token — 請新增 `CLAUDE_CODE_OAUTH_TOKEN`（來自 `claude setup-token`）。可微調參數：`CLAUDE_SDK_FOR`（`exits` [預設] | `all` | `none`）與 `CLAUDE_SDK_MODEL`（預設 `sonnet`）。若無 token，機器人將如以往般僅以 Haiku 執行。
 
-**選用 — 透過 Antigravity 訂閱使用 Gemini。** 設定 `USE_AGY_GEMINI=1` 可讓分析師與出場分析師改走 `agy` CLI，使用 Google AI 訂閱額度而非 Gemini API 金鑰。該額度以運算量計量、**每週**重置，因此耗盡後是數日的鎖定而非隔日恢復；agy 的任何失敗都會自動退回 API 鏈。可微調參數：`AGY_MODEL`（預設 `Gemini 3.6 Flash (High)`）、`AGY_BIN`、`AGY_TIMEOUT`。
+**選用 — 透過 Antigravity 訂閱使用 Gemini。** 設定 `USE_AGY_GEMINI=1` 可讓分析師與出場分析師改走 `agy` CLI，使用 Google AI 訂閱額度而非 Gemini API 金鑰。該額度以運算量計量、**每週**重置，因此耗盡後是數日的鎖定而非隔日恢復；agy 的任何失敗都會自動退回 API 鏈。可微調參數：`AGY_MODEL`（預設 `Gemini 3.8 Flash (High)`）、`AGY_BIN`、`AGY_TIMEOUT`。
 
 **選用 — 額度閥門。** 設定 `EXIT_GATE=1` 後，僅有股價低於 5 日均線的部位才會進行 LLM 出場複核。以 19,654 筆歷史複核實測：可減少約 65% 的出場分析師呼叫，同時仍能觸發 73% 的實際成交出場；市場資料不可用時採 fail-open（照常複核）。預設關閉 — 只有當瓶頸是額度而非準確度時，這筆交換才划算。
 

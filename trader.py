@@ -335,17 +335,18 @@ ANALYST_SYSTEM = (
 
 # Tried in order — best quality first. 429 = quota/paid-wall (skip), 404 = missing
 # (skip), 503 = temporary overload (one retry then skip to next).
-# Verified against the live free-tier model list and quota dashboard on
-# 2026-08-30. Dropped: gemini-3.1-pro-preview, gemini-3-pro-preview and
-# gemini-2.5-pro all report quotaValue 0 on the free tier, and the -preview
-# suffix on 3.1-flash-lite no longer resolves -- four wasted round trips
-# before the chain reached anything that could answer. Ordered by measured
-# answer quality, with flash-lite last because it is much weaker but carries
-# 500 RPD against every other entry's 20 and so is the capacity backstop.
+# Verified against the live free-tier model list on 2026-09-04. Ordered by measured
+# answer quality; flash-lite stays last because it is much weaker but carries 500 RPD
+# against every other entry's 20, making it the capacity backstop rather than a
+# preference. 3.8 leads despite answering only 3 of 5 free-tier probes on release
+# day -- a "high demand" reply returns immediately and 3.6 is one hop behind, which
+# costs less than letting the fallback path reach different verdicts than the
+# primary one.
 GEMINI_MODEL_PRIORITY = [
-    "gemini-3.6-flash",             # best measured; answers reliably on free tier
-    "gemini-3.7-flash",             # equal quality, but often "high demand" here
-    "gemini-3.5-flash",             # previous chain head
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",             # answered 5 of 5 free-tier probes
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
     "gemini-3-flash-preview",
     "gemini-2.5-flash",
     "gemini-3.1-flash-lite",        # 500 RPD -- last resort, weakest of the set
@@ -793,7 +794,9 @@ GEMINI_CLI_PATH       = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
 # exhausts the loop drops to Flash on the next iteration. Override via
 # GEMINI_CLI_EXIT_MODELS env (comma-separated). Singular GEMINI_CLI_EXIT_MODEL
 # is honoured for backward compat (becomes the head of the chain).
-_default_cli_chain = "gemini-3.5-flash,gemini-3.1-pro-preview,gemini-3-pro-preview,gemini-3-flash-preview,gemini-2.5-flash"
+# Same free-tier reality as GEMINI_MODEL_PRIORITY above: the three Pro entries
+# reported quotaValue 0 and only ever cost a 429 and a retry delay.
+_default_cli_chain = "gemini-3.8-flash,gemini-3.6-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash"
 _legacy_single = os.environ.get("GEMINI_CLI_EXIT_MODEL")
 GEMINI_CLI_EXIT_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_CLI_EXIT_MODELS", _legacy_single or _default_cli_chain).split(",")
@@ -814,14 +817,17 @@ USE_GEMINI_EXIT_CLI   = os.environ.get("USE_GEMINI_EXIT_CLI", "0").lower() in ("
 # lockout with no intra-day refill on the AI Plus tier. When USE_AGY_GEMINI=1 the
 # analyst and exit analyst try agy first and fall back to the Gemini API chain.
 AGY_BIN        = os.environ.get("AGY_BIN", str(Path.home() / ".local" / "bin" / "agy"))
-# Default is 3.6 Flash (High) as of 2026-08-30. A benchmark with computed ground
-# truth found 3.6 and 3.7 Flash indistinguishable on this kind of work and both
-# well ahead of 3.5, so the tie breaks on availability: on the Gemini free tier --
-# where this bot lands whenever agy fails -- 3.6 answers every call while 3.7
-# mostly returns "high demand", so primary and fallback now run the same model.
+# Default is 3.8 Flash (High) as of 2026-09-04. Google's own evals put 3.8 ahead of
+# 3.7 on every task family reported, including the financial-analyst set that is the
+# closest published analogue to this bot's work (61.4% vs 59.0%), at the same price.
+# There is no independent measurement on this specific task yet -- solver-verified-bench
+# has not been re-run against 3.8 -- so treat this as following the vendor's numbers,
+# not as a local result. Watch the exit-action mix: 3.6 returned HOLD on all 997
+# reviews between 2026-08-31 and 09-03 against a 0.34% historical TRIM/EXIT base rate,
+# so a model change here can quietly silence the AI exit path.
 # If subscription quota gets tight, drop to "(Medium)" before changing generation;
 # the effort tier costs more than the generation does.
-AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.6 Flash (High)")
+AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.8 Flash (High)")
 AGY_TIMEOUT    = int(os.environ.get("AGY_TIMEOUT", "120"))
 USE_AGY_GEMINI = os.environ.get("USE_AGY_GEMINI", "0").lower() in ("1", "true", "yes")
 

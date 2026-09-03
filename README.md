@@ -15,7 +15,7 @@ Each run (every 30 min, 9:30–16:00 ET, weekdays) executes a pipeline per ticke
 
 1. **Market data + news** — price history via yfinance, headlines via Alpaca news API.
 2. **Analyst** (Gemini) — BUY/SELL/HOLD recommendation with confidence + reasoning.
-   Walks a model-priority chain (`gemini-3.6-flash` → `gemini-3.7-flash` → … →
+   Walks a model-priority chain (`gemini-3.8-flash` → `gemini-3.6-flash` → … →
    `gemini-3.1-flash-lite`) so it degrades gracefully when a model is quota-gated.
 3. **Sentiment** (Hugging Face) — BULLISH/BEARISH/NEUTRAL second opinion. It only
    blocks a trade when it **directly contradicts** the analyst (BUY vs BEARISH, or
@@ -78,7 +78,7 @@ analyst and exit analyst through the `agy` CLI, drawing on a Google AI subscript
 instead of the Gemini API key. That quota meters compute and resets **weekly**, so
 exhausting it returns a multi-day lockout rather than a next-day reset; any agy
 failure falls back to the API chain automatically. Tunables: `AGY_MODEL` (default
-`Gemini 3.6 Flash (High)`), `AGY_BIN`, `AGY_TIMEOUT`.
+`Gemini 3.8 Flash (High)`), `AGY_BIN`, `AGY_TIMEOUT`.
 
 **Optional — quota valve.** `EXIT_GATE=1` limits the LLM exit review to positions
 trading below their 5-day moving average. Measured across 19,654 historical reviews
