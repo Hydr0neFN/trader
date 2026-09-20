@@ -58,6 +58,7 @@ absence of data must be stated, not hallucinated.
 | Position size | 2% of equity | `POSITION_SIZE_PCT` |
 | Max concurrent positions | 8 | `MAX_POSITIONS` |
 | Cash floor never spent | $500 | `CASH_RESERVE_USD` |
+| Minimum size for a cash-trimmed order | $750 | `MIN_TRADE_USD` |
 | Tickers per batch | 10 | `TICKER_BATCH_SIZE` |
 
 Position sizing is a percentage of *portfolio value*, which says nothing about
@@ -66,8 +67,12 @@ POSITION_SIZE_PCT <= 100%` was the only thing keeping the bot off margin — and
 paper account is typically handed ~4x buying power, so an over-budget order fills
 silently on borrowed money rather than failing. `execute_trades()` now tracks
 spendable cash across the run, trims an order to what cash covers, and records
-`SKIPPED_CASH` once it is exhausted. Sell proceeds are not credited back mid-run,
-since they are unsettled until the fill lands.
+`SKIPPED_CASH` once it is exhausted. Unfilled BUY orders left over from an earlier
+run are charged against both the cash and the slot budget before either is spent
+again, since Alpaca debits cash on fill rather than on submission. SELLs are
+processed ahead of BUYs and their proceeds credited back, so a full book can still
+rotate; a trim that would land below `MIN_TRADE_USD` is skipped rather than allowed
+to spend a position slot on a stub.
 
 The **trailing stop** arms only after a position's running peak gains
 `TRAIL_ACTIVATE_PCT` above entry, then exits on a `TRAIL_STOP_PCT` pullback from

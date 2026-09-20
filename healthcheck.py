@@ -115,7 +115,7 @@ def notify_degraded(msg: str) -> None:
         prev = datetime.fromisoformat(DEGRADED_MARKER.read_text().split()[0])
         if (now - prev).total_seconds() < DEGRADED_REALERT_H * 3600:
             return
-    except (OSError, ValueError, IndexError):
+    except (OSError, ValueError, IndexError, TypeError):
         pass
 
     ts = now.isoformat()
@@ -205,17 +205,33 @@ def main() -> int:
     # Fresh, but the run may still have flown blind: a total sentiment-chain
     # failure leaves every ticker at NEUTRAL/0 without stopping the run.
     rec = last_run_complete() or {}
-    fails = rec.get("sentiment_failures", 0)
-    if fails:
-        notify_degraded(
-            f"sentiment LLM chain down: {fails} ticker(s) fell through every "
-            f"provider (HF + Cloudflare) last run — trading on price data only"
-        )
-    else:
+    rec_age_min = None
+    rec_ts = rec.get("timestamp")
+    if rec_ts:
         try:
-            DEGRADED_MARKER.unlink()
-        except OSError:
-            pass
+            rec_age_min = (now - datetime.fromisoformat(rec_ts)
+                           .astimezone(timezone.utc)).total_seconds() / 60
+        except (ValueError, TypeError):
+            rec_age_min = None
+
+    if rec_age_min is not None and rec_age_min <= MAX_AGE_MIN:
+        fails = rec.get("sentiment_failures", 0)
+        # `sentiment_calls` is what separates "asked and it worked" from "never
+        # asked". trader.py skips the sentiment step entirely on a HOLD, so an
+        # all-HOLD run reports zero failures while telling us nothing about the
+        # provider chain. Clearing the marker on that would drop the rate limit
+        # and re-alert the same ongoing outage on the next non-HOLD run.
+        calls = rec.get("sentiment_calls")
+        if fails:
+            notify_degraded(
+                f"sentiment LLM chain down: {fails} ticker(s) fell through every "
+                f"provider (HF + Cloudflare) last run — trading on price data only"
+            )
+        elif calls:
+            try:
+                DEGRADED_MARKER.unlink()
+            except OSError:
+                pass
 
     # Healthy — clear any prior stale marker.
     try:

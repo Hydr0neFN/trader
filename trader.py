@@ -82,6 +82,9 @@ MAX_POSITIONS     = int(os.environ.get("MAX_POSITIONS",       "8"))
 # Cash floor kept unspent, so a market order that slips between sizing and
 # fill cannot tip the account onto margin.
 CASH_RESERVE_USD  = float(os.environ.get("CASH_RESERVE_USD", "500"))
+# A cash-trimmed order is only worth a position slot if it is big enough to
+# matter. Below this the slot is better left open for a full-size candidate.
+MIN_TRADE_USD     = float(os.environ.get("MIN_TRADE_USD", "750"))
 TICKER_BATCH_SIZE = int(os.environ.get("TICKER_BATCH_SIZE",   "10"))
 
 COMPANY_NAMES = {
@@ -440,21 +443,38 @@ CF_API_TOKEN  = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
 # Counts runs where the whole sentiment chain fell over, surfaced in run_log so
 # healthcheck.py can alert -- the 2026-09 outage went 5 days unnoticed because
 # a total LLM failure only ever produced a WARNING line nobody read.
-SENTIMENT_STATE = {"failures": 0}
+# `calls` matters as much as `failures`: a run where every analyst verdict was
+# HOLD never reaches the sentiment step at all, so failures==0 there means "not
+# asked", not "recovered". healthcheck.py needs both to tell those apart.
+# `hf_disabled` latches after a 402 -- credit exhaustion is deterministic for
+# the rest of the month, so re-probing it once per ticker only burns wall clock.
+SENTIMENT_STATE = {"failures": 0, "calls": 0, "hf_disabled": False}
+
+# One client per provider per process. Rebuilding these per ticker throws away
+# the connection pool and repeats the TLS handshake for every candidate.
+_HF_CLIENT = None
+_CF_CLIENT = None
 
 
 def _sentiment_providers():
     """(client, model) in priority order: HF primary, Cloudflare free fallback."""
-    yield HFClient(token=HF_API_TOKEN), HF_SENTIMENT_MODEL
+    global _HF_CLIENT, _CF_CLIENT
+
+    if not SENTIMENT_STATE["hf_disabled"]:
+        if _HF_CLIENT is None:
+            _HF_CLIENT = HFClient(token=HF_API_TOKEN)
+        yield _HF_CLIENT, HF_SENTIMENT_MODEL
+
     if CF_ACCOUNT_ID and CF_API_TOKEN:
         # Cloudflare Workers AI speaks the OpenAI chat-completions schema, so
         # the same client call shape works with a swapped base_url.
-        cf = HFClient(
-            base_url=f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1",
-            token=CF_API_TOKEN,
-        )
+        if _CF_CLIENT is None:
+            _CF_CLIENT = HFClient(
+                base_url=f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1",
+                token=CF_API_TOKEN,
+            )
         for model in CF_SENTIMENT_MODELS:
-            yield cf, model
+            yield _CF_CLIENT, model
 
 
 def run_sentiment_analyst(data_block: str) -> dict:
@@ -488,10 +508,18 @@ def run_sentiment_analyst(data_block: str) -> dict:
                     "model":      m,
                 }
 
-            return retry(call, retries=1, delay=3.0)
+            result = retry(call, retries=1, delay=3.0)
+            SENTIMENT_STATE["calls"] += 1
+            return result
 
         except Exception as exc:
-            log.warning("Sentiment model %s failed (%s) -- trying next...", model, str(exc)[:60])
+            if "402" in str(exc) and model == HF_SENTIMENT_MODEL:
+                # Credit exhaustion is not transient. Stop paying 4 attempts
+                # and 6s of sleep per candidate for a certain answer.
+                SENTIMENT_STATE["hf_disabled"] = True
+                log.warning("HF returned 402 (credits exhausted) -- skipping HF "
+                            "for the rest of this run")
+            log.warning("Sentiment model %s failed (%s) -- trying next...", model, str(exc)[:200])
             last_exc = exc
             continue
 
@@ -1100,6 +1128,31 @@ def open_order_symbols(client: TradingClient) -> set:
         return set()
 
 
+def pending_buy_exposure(client: TradingClient) -> tuple:
+    """(count, notional) of still-unfilled BUY orders.
+
+    Alpaca does not debit `cash` when an order is submitted, only when it
+    fills, and an unfilled BUY is not yet a position either -- so a DAY order
+    left open at the close is invisible to both the cash guard and the slot
+    count on the next run. Both would then be spent twice.
+    """
+    try:
+        orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    except Exception as exc:
+        log.warning("Could not fetch open orders (%s) -- assuming none pending", exc)
+        return 0, 0.0
+    count = 0
+    notional = 0.0
+    for o in orders:
+        if str(getattr(o, "side", "")).lower().endswith("buy"):
+            count += 1
+            qty = float(getattr(o, "qty", 0) or 0)
+            ref = getattr(o, "limit_price", None) or getattr(o, "filled_avg_price", None)
+            if ref:
+                notional += qty * float(ref)
+    return count, notional
+
+
 def _client_order_id(tag: str, ticker: str) -> str:
     """Unique, broker-safe client_order_id for idempotency + traceability."""
     return f"{tag}-{ticker}-{now_et().strftime('%Y%m%d%H%M%S')}"[:128]
@@ -1127,6 +1180,20 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
     open_count = len(positions)
     pending    = open_order_symbols(client)   # tickers with an unfilled order
     ts         = now_et().isoformat()
+
+    # An unfilled BUY from an earlier run is neither a position nor a cash
+    # debit yet, so charge it against both budgets before spending them again.
+    pending_buys, pending_notional = pending_buy_exposure(client)
+    if pending_buys:
+        open_count     += pending_buys
+        cash_remaining -= pending_notional
+        log.info("  %d unfilled BUY order(s) held against the budget ($%.2f)",
+                 pending_buys, pending_notional)
+
+    # SELLs first: a sell frees both a slot and its proceeds, and the analyst
+    # list arrives in static ticker order, so a rotation whose buy happens to
+    # sort ahead of its sell would otherwise be rejected on a full book.
+    approved = sorted(approved, key=lambda r: r.get("recommendation") != "SELL")
 
     status: dict = {}
     bought: set = set()   # guards against duplicate analyst recs double-buying
@@ -1156,7 +1223,9 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
             # Trim to what cash covers rather than borrowing the difference.
             if qty * price > cash_remaining:
                 affordable = int(cash_remaining / price)
-                if affordable < 1:
+                # A stub position still consumes a MAX_POSITIONS slot, so a
+                # trim that lands below MIN_TRADE_USD is worse than no trade.
+                if affordable < 1 or affordable * price < MIN_TRADE_USD:
                     log.info("SKIP %s BUY: cash exhausted ($%.2f spendable, share $%.2f)",
                              ticker, cash_remaining, price)
                     status[ticker] = "SKIPPED_CASH"
@@ -1172,6 +1241,12 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                     time_in_force=TimeInForce.DAY,
                     client_order_id=_client_order_id("buy", ticker),
                 ))
+                # Commit the budget the moment the broker accepts the order.
+                # Booking it after the log write would let an OSError on a full
+                # disk hand the same cash to the next candidate as well.
+                open_count += 1
+                cash_remaining -= qty * price
+                bought.add(ticker)
                 fees = calc_sim_fees("BUY", qty, price)
                 jsonl_append(LOG_DIR / "executed.jsonl", {
                     "timestamp":  ts,
@@ -1186,9 +1261,6 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                 })
                 log.info("BUY  %dx %s @ ~$%.2f | sim_fee=$%.4f | order %s",
                          qty, ticker, price, fees["sim_total_fee"], order.id)
-                open_count += 1
-                cash_remaining -= qty * price
-                bought.add(ticker)
                 status[ticker] = "EXECUTED"
             except Exception as exc:
                 log.error("BUY order failed for %s: %s", ticker, exc)
@@ -1213,6 +1285,11 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                     time_in_force=TimeInForce.DAY,
                     client_order_id=_client_order_id("sell", ticker),
                 ))
+                # Proceeds are spendable for the rest of this run: the
+                # account is a margin account (multiplier 4), so an equity sale
+                # restores buying power on fill rather than on settlement.
+                # Without this a full book can sell but never rotate.
+                cash_remaining += held_qty * price
                 fees = calc_sim_fees("SELL", held_qty, price)
                 jsonl_append(LOG_DIR / "executed.jsonl", {
                     "timestamp":  ts,
@@ -1609,7 +1686,7 @@ def main() -> None:
              run_ts, len(TICKERS), TICKER_BATCH_SIZE, MAX_POSITIONS, MAX_POSITION_PCT * 100)
 
     # API call counters for run_log
-    api_calls = {"gemini": 0, "hf": 0, "haiku": 0, "exit_gemini": 0, "exit_haiku": 0}
+    api_calls = {"gemini": 0, "hf": 0, "cf": 0, "haiku": 0, "exit_gemini": 0, "exit_haiku": 0}
 
     # ── Step 0a: Hard stop-loss (pure math, no AI) ────────────────────────
     log.info("Step 0a: Hard stop-loss check (≥%.0f%% loss)…", STOP_LOSS_PCT)
@@ -1792,7 +1869,7 @@ def main() -> None:
             hf = retry(lambda t=ticker: run_sentiment_analyst(
                 build_data_block(data_map[t], headlines_map.get(t, []))
             ), retries=1, delay=3.0)
-            api_calls["hf"] += 1
+            api_calls["cf" if str(hf.get("model", "")).startswith("@cf/") else "hf"] += 1
         except Exception as exc:
             log.warning("  %-6s HF error: %s", ticker, exc)
             hf = {"sentiment": "NEUTRAL", "confidence": 0,
@@ -2055,6 +2132,7 @@ def main() -> None:
         "api_calls":           api_calls,
         "cumulative_sim_fees": cumulative_sim_fees,
         "sentiment_failures":  SENTIMENT_STATE["failures"],
+        "sentiment_calls":     SENTIMENT_STATE["calls"],
     })
     log.info("=== Run complete ===")
 
