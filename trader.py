@@ -85,6 +85,10 @@ CASH_RESERVE_USD  = float(os.environ.get("CASH_RESERVE_USD", "500"))
 # A cash-trimmed order is only worth a position slot if it is big enough to
 # matter. Below this the slot is better left open for a full-size candidate.
 MIN_TRADE_USD     = float(os.environ.get("MIN_TRADE_USD", "750"))
+# Analyst-confidence veto threshold. A named constant rather than a literal at
+# the comparison site so tools/readme_rails.py can read it, and so the number
+# appears exactly once in the file.
+CONFIDENCE_FLOOR_PCT = 70
 TICKER_BATCH_SIZE = int(os.environ.get("TICKER_BATCH_SIZE",   "10"))
 
 COMPANY_NAMES = {
@@ -1977,8 +1981,9 @@ def main() -> None:
         veto_reasons = []
         if verdict != "APPROVED":
             veto_reasons.append(f"Haiku veto: {justification}")
-        if gemini_confidence < 70:
-            veto_reasons.append(f"Gemini confidence too low ({gemini_confidence}% < 70%)")
+        if gemini_confidence < CONFIDENCE_FLOOR_PCT:
+            veto_reasons.append(f"Gemini confidence too low "
+                                f"({gemini_confidence}% < {CONFIDENCE_FLOOR_PCT}%)")
         if not sentiment_ok:
             veto_reasons.append(f"HF sentiment mismatch: {action} but {hf_sentiment}")
 
