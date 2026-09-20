@@ -1,12 +1,15 @@
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from flask import Flask, render_template, request
+from flask import Flask, make_response, redirect, render_template, request
+
+import i18n
 from alpaca.trading.client import TradingClient
 import yfinance as yf
 
@@ -84,6 +87,98 @@ def read_jsonl(filename: str) -> list:
     return lines
 
 
+def tail_jsonl(filename: str, n: int) -> list:
+    """Last n parseable records of a JSONL file, read from the end.
+
+    read_jsonl() parses the whole file, which is fine for the small logs but not
+    for decisions.jsonl (~90 MB). Seeking a fixed window from the end keeps this
+    O(window) no matter how large the log grows.
+    """
+    path = LOG_DIR / filename
+    if not path.exists():
+        return []
+    window = 256 * 1024
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - window))
+            chunk = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    # The first line is probably a fragment of a record that starts before the
+    # window, so drop it whenever we did not start at byte 0.
+    lines = chunk.splitlines()
+    if size > window and lines:
+        lines = lines[1:]
+    out = []
+    for line in lines[-n:]:
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def _clean_model_id(raw) -> str:
+    """Tidy a model id with rules only — never a name lookup, because a lookup
+    table is exactly what went stale in the footer before.
+
+    agy:Gemini 3.8 Flash (High)   → Gemini 3.8 Flash
+    deepseek-ai/DeepSeek-V3.2-Exp → DeepSeek-V3.2-Exp
+    claude-haiku-4-5-20251001     → claude-haiku-4-5
+    """
+    s = str(raw or "").strip()
+    s = re.sub(r"^[A-Za-z0-9_.-]+:", "", s)   # provider scheme, e.g. "agy:"
+    s = s.split("/")[-1]                       # namespace, e.g. "deepseek-ai/"
+    s = re.sub(r"\s*\([^)]*\)", "", s)          # mode suffix, e.g. " (High)"
+    s = re.sub(r"[-_@]\d{8}$", "", s)           # snapshot date, e.g. "-20251001"
+    s = re.sub(r"[:-]latest$", "", s, flags=re.I)
+    return s.strip()
+
+
+def active_models() -> list:
+    """The models this bot is actually running right now, newest evidence first.
+
+    The footer used to carry a hand-written list ("Gemini 3 Flash + Claude
+    Haiku") that drifted from the code: the Gemini model is chosen at runtime
+    from a fallback chain or from agy, Claude answers on two different tiers,
+    and the sentiment agent was missing from the list entirely. Deriving it from
+    the logs means it cannot go stale again.
+    """
+    def _fresh(fn):
+        try:
+            return fn()
+        except Exception:
+            return []
+
+    def _from_llm_calls():
+        seen = []
+        for r in tail_jsonl("llm_calls.jsonl", 200):
+            m = r.get("model")
+            if m and m not in seen:
+                seen.append(m)
+        return seen
+
+    def _from_decisions():
+        seen = []
+        for r in tail_jsonl("decisions.jsonl", 120):
+            for key in ("gemini_model", "hf_model"):
+                m = r.get(key)
+                if m and m not in ("none", "N/A") and m not in seen:
+                    seen.append(m)
+        return seen
+
+    out = []
+    for m in _fresh(_from_decisions) + _fresh(_from_llm_calls):
+        m = _clean_model_id(m)
+        if m and m not in out:
+            out.append(m)
+    return out[:4]
+
+
 def parse_dt(s):
     """Parse an ISO timestamp, coercing naive values to UTC. None on failure."""
     try:
@@ -118,6 +213,52 @@ def fmt_pct(val) -> str:
         return "—"
 
 
+# ── Language ──────────────────────────────────────────────────────────────────
+# Default follows Accept-Language, which follows the OS/browser setting; the
+# navbar toggle writes a cookie that overrides it. Injected into every template
+# rather than passed per-route, so a new page is bilingual by construction.
+def _asset_v(name: str) -> int:
+    """mtime of a file in /static, appended to its URL as ?v=.
+
+    /static is served with `max-age=14400`, so without this a deploy leaves an
+    already-open browser on the previous stylesheet for four hours — which is
+    exactly what happened on 2026-09-09 and took a manual hard reload to clear.
+    """
+    try:
+        return int((Path(app.static_folder) / name).stat().st_mtime)
+    except OSError:
+        return 0
+
+
+@app.context_processor
+def inject_i18n():
+    lang = i18n.choose(
+        cookie_val=request.cookies.get(i18n.COOKIE),
+        query_val=request.args.get("lang"),
+        accept_language=request.headers.get("Accept-Language"),
+    )
+    ctx = i18n.make_helpers(lang)
+    ctx["js_i18n"] = json.dumps(i18n.js_table(lang))
+    # 60 s is plenty: the models only change when the cron runs.
+    ctx["active_models"] = cached("active_models", 60, active_models)
+    ctx["theme_v"] = cached("theme_v", 10, lambda: _asset_v("theme.css"))
+    return ctx
+
+
+@app.route("/lang/<code>")
+def set_lang(code):
+    """Persist a language choice and return where the user came from."""
+    lang = i18n.normalize(code) or i18n.DEFAULT_LANG
+    nxt = request.args.get("next", "/")
+    # Only ever redirect within this site.
+    if not nxt.startswith("/") or nxt.startswith("//"):
+        nxt = "/"
+    resp = make_response(redirect(nxt, code=302))
+    resp.set_cookie(i18n.COOKIE, lang, max_age=60 * 60 * 24 * 365,
+                    samesite="Lax", path="/")
+    return resp
+
+
 # Register template filters
 app.jinja_env.filters["fmt_ts"]       = fmt_ts
 app.jinja_env.filters["fmt_currency"] = fmt_currency
@@ -147,6 +288,44 @@ def _sparklines(symbols: list) -> dict:
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+def _position_rows() -> tuple[list, str | None]:
+    """(rows, error) for the open-positions table. Shared by the overview page;
+    both callers hit the same 20 s account/positions cache, so embedding the
+    table costs no extra Alpaca traffic."""
+    rows: list = []
+    try:
+        client    = get_alpaca()
+        account   = cached("account", 20, client.get_account)
+        positions = cached("positions", 20, client.get_all_positions)
+        port_val  = float(account.portfolio_value) if account else 0.0
+
+        for p in positions:
+            mv = float(p.market_value)
+            rows.append({
+                "symbol":       p.symbol,
+                "qty":          float(p.qty),
+                "avg_entry":    float(p.avg_entry_price),
+                "current":      float(p.current_price),
+                "market_value": mv,
+                "unreal_pl":    float(p.unrealized_pl),
+                "unreal_plpct": float(p.unrealized_plpc) * 100,
+                # PositionSide is a str-Enum: str(p.side) → "PositionSide.long".
+                # Use .value so the template's r.side == 'LONG' check matches.
+                "side":         str(getattr(p.side, "value", p.side)).upper(),
+                # Portfolio weight — share of total equity in this position.
+                "allocation":   (mv / port_val * 100) if port_val else 0.0,
+            })
+        syms   = [r["symbol"] for r in rows]
+        sparks = cached("sparklines_" + ",".join(sorted(syms)), 1800, lambda: _sparklines(syms))
+        for r in rows:
+            r["spark"] = sparks.get(r["symbol"], [])
+    except Exception as exc:
+        return [], str(exc)
+
+    rows.sort(key=lambda r: r["market_value"], reverse=True)
+    return rows, None
+
 
 @app.route("/")
 def overview():
@@ -203,6 +382,8 @@ def overview():
         for h in history if h.get("timestamp")   # skip schema-drifted lines
     ]
 
+    rows, positions_error = _position_rows()
+
     return render_template(
         "overview.html",
         account=account_data,
@@ -212,45 +393,15 @@ def overview():
         chart_data=json.dumps(chart_data),
         cumulative_sim_fees=cumulative_sim_fees,
         net_pnl=net_pnl,
+        rows=rows,
+        positions_error=positions_error,
     )
 
 
 @app.route("/positions")
 def positions():
-    rows  = []
-    error = None
-
-    try:
-        client    = get_alpaca()
-        account   = cached("account", 20, client.get_account)
-        positions = cached("positions", 20, client.get_all_positions)
-        port_val  = float(account.portfolio_value) if account else 0.0
-
-        for p in positions:
-            mv = float(p.market_value)
-            rows.append({
-                "symbol":       p.symbol,
-                "qty":          float(p.qty),
-                "avg_entry":    float(p.avg_entry_price),
-                "current":      float(p.current_price),
-                "market_value": mv,
-                "unreal_pl":    float(p.unrealized_pl),
-                "unreal_plpct": float(p.unrealized_plpc) * 100,
-                # PositionSide is a str-Enum: str(p.side) → "PositionSide.long".
-                # Use .value so the template's r.side == 'LONG' check matches.
-                "side":         str(getattr(p.side, "value", p.side)).upper(),
-                # Portfolio weight — share of total equity in this position.
-                "allocation":   (mv / port_val * 100) if port_val else 0.0,
-            })
-        syms   = [r["symbol"] for r in rows]
-        sparks = cached("sparklines_" + ",".join(sorted(syms)), 1800, lambda: _sparklines(syms))
-        for r in rows:
-            r["spark"] = sparks.get(r["symbol"], [])
-    except Exception as exc:
-        error = str(exc)
-
-    rows.sort(key=lambda r: r["market_value"], reverse=True)
-    return render_template("positions.html", rows=rows, error=error)
+    """Holdings now live on the overview; keep the old URL working."""
+    return redirect("/", code=302)
 
 
 @app.route("/history")
@@ -341,19 +492,19 @@ def history():
     # Reuse already-loaded executed/vetoed instead of re-reading both files.
     all_tickers = sorted({r.get("ticker", "") for r in (executed + vetoed)})
 
-    def row_json(r: dict) -> str:
-        return json.dumps({k: v for k, v in r.items() if k != "_type"}, default=str)
+    # One payload for the page. "</" is escaped so a reasoning string containing
+    # "</script>" cannot close the block it is embedded in.
+    rows_json = json.dumps(combined, default=str).replace("</", "<\\/")
 
     return render_template(
         "history.html",
         rows=combined,
-        row_json=row_json,
+        rows_json=rows_json,
         all_tickers=all_tickers,
         ticker_filter=ticker_filter,
         date_from=date_from,
         date_to=date_to,
         total_matched=total_matched,
-        shown=len(combined),
     )
 
 

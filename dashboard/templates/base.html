@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-bs-theme="dark">
+<html lang="{{ 'zh-Hant-TW' if lang == 'zh' else 'en' }}" data-bs-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -12,77 +12,13 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg:        #090d16;
-      --card:      #121824;
-      --card-head: #192030;
-      --border:    #26324d;
-      --text:      #cdd9e5;
-      --muted:     #8b949e;
-      --pos:       #3fb950;
-      --neg:       #f85149;
-      --warn:      #d29922;
-      --accent:    #1f6feb;
-    }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    .navbar { background: var(--card) !important; border-color: var(--border) !important; }
-    .navbar-brand { font-weight: 700; letter-spacing: .5px; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
-    .card-header { background: var(--card-head); border-bottom: 1px solid var(--border); font-weight: 600; }
-    .stat-card { transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease; }
-    .stat-card:hover { transform: translateY(-2px); border-color: var(--accent); box-shadow: 0 4px 16px rgba(31,111,235,.15); }
-    .stat-value { font-size: 1.6rem; font-weight: 800; letter-spacing: -.5px; }
-    .stat-label { font-size: .78rem; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); font-weight: 600; }
-    .mono { font-family: 'Geist Mono', ui-monospace, SFMono-Regular, monospace; }
-    .stat-value, table td, table th { font-variant-numeric: tabular-nums; }
-    .pnl-pos { color: var(--pos); }
-    .pnl-neg { color: var(--neg); }
-    .badge-buy      { background: rgba(63,185,80,.12);   color: #4ae05d; border: 1px solid rgba(63,185,80,.30); }
-    .badge-sell     { background: rgba(248,81,73,.12);   color: #ff6e67; border: 1px solid rgba(248,81,73,.30); }
-    .badge-veto     { background: rgba(210,153,34,.12);  color: #e3b341; border: 1px solid rgba(210,153,34,.30); }
-    .badge-hold     { background: rgba(139,148,158,.12); color: #adbac7; border: 1px solid rgba(139,148,158,.30); }
-    .badge-approved { background: rgba(63,185,80,.12);   color: #4ae05d; border: 1px solid rgba(63,185,80,.30); }
-    table { font-size: .9rem; }
-    .table-hover tbody tr:hover > * { background-color: rgba(38,50,77,.25) !important; }
-    .nav-link.active { background: var(--accent) !important; border-radius: 6px; }
-    .reasoning-text { font-size: .82rem; color: #adbac7; line-height: 1.45; }
-    .chart-container { position: relative; height: 280px; }
-    .pl-heat { display:inline-flex; flex-direction:column; align-items:flex-end; padding:4px 10px; border-radius:6px; min-width:92px; }
-    .pl-heat .v { font-size:.85rem; font-weight:700; }
-    .pl-heat .p { font-size:.72rem; opacity:.85; }
-    .pl-heat.pos1 { background:rgba(63,185,80,.07);  color:#4ae05d; border:1px solid rgba(63,185,80,.18); }
-    .pl-heat.pos2 { background:rgba(63,185,80,.15);  color:#56ee6a; border:1px solid rgba(63,185,80,.38); }
-    .pl-heat.pos3 { background:rgba(63,185,80,.24);  color:#66ff7c; border:1px solid rgba(63,185,80,.55); }
-    .pl-heat.neg1 { background:rgba(248,81,73,.07);  color:#ff6e67; border:1px solid rgba(248,81,73,.18); }
-    .pl-heat.neg2 { background:rgba(248,81,73,.15);  color:#ff857f; border:1px solid rgba(248,81,73,.38); }
-    .pl-heat.neg3 { background:rgba(248,81,73,.24);  color:#ff9e99; border:1px solid rgba(248,81,73,.55); }
-    .alloc-bar { height:6px; border-radius:3px; background:rgba(48,54,61,.6); overflow:hidden; }
-    .alloc-bar > span { display:block; height:100%; background:var(--accent); border-radius:3px; }
-    .pipe { display:flex; flex-direction:column; padding:4px 2px; }
-    .pipe-step { position:relative; padding-left:34px; margin-bottom:18px; }
-    .pipe-step::before { content:""; position:absolute; left:11px; top:22px; bottom:-18px; width:2px; background:var(--border); }
-    .pipe-step:last-child::before { display:none; }
-    .pipe-ic { position:absolute; left:0; top:0; width:24px; height:24px; border-radius:50%; background:var(--bg); border:2px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:.72rem; color:var(--muted); }
-    .pipe-step.ok   .pipe-ic { border-color:var(--pos);    color:var(--pos); }
-    .pipe-step.no   .pipe-ic { border-color:var(--neg);    color:var(--neg); }
-    .pipe-step.info .pipe-ic { border-color:var(--accent); color:var(--accent); }
-    .pipe-t { font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); margin-bottom:6px; }
-    .pipe-card { background:var(--card-head); border:1px solid var(--border); border-radius:8px; padding:12px; font-size:.82rem; }
-    @media (max-width: 576px) {
-      .stat-value { font-size: 1.2rem; }
-      .chart-container { height: 220px; }
-    }
-  </style>
+  {# Shared with the DOWTrade dashboard — keep the two copies identical. #}
+  <link href="{{ url_for('static', filename='theme.css') }}?v={{ theme_v }}" rel="stylesheet">
   {% block head %}{% endblock %}
 </head>
 <body>
 
-<nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary mb-4">
+<nav class="navbar navbar-expand-lg navbar-dark border-bottom border-secondary mb-4">
   <div class="container-fluid px-4">
     <a class="navbar-brand" href="/">
       <i class="bi bi-graph-up-arrow me-2 text-primary"></i>Trader
@@ -91,27 +27,23 @@
       <span class="navbar-toggler-icon"></span>
     </button>
     <div class="collapse navbar-collapse" id="navMenu">
-      <ul class="navbar-nav ms-auto gap-1">
+      <ul class="navbar-nav ms-auto gap-1 align-items-lg-center">
         <li class="nav-item">
           <a class="nav-link {% if request.path == '/' %}active{% endif %}" href="/">
-            <i class="bi bi-speedometer2 me-1"></i>Overview
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link {% if request.path == '/positions' %}active{% endif %}" href="/positions">
-            <i class="bi bi-briefcase me-1"></i>Positions
+            <i class="bi bi-speedometer2 me-1"></i>{{ L('nav.overview') }}
           </a>
         </li>
         <li class="nav-item">
           <a class="nav-link {% if request.path == '/history' %}active{% endif %}" href="/history">
-            <i class="bi bi-clock-history me-1"></i>History
+            <i class="bi bi-clock-history me-1"></i>{{ L('nav.history') }}
           </a>
         </li>
         <li class="nav-item">
           <a class="nav-link {% if request.path == '/decisions' %}active{% endif %}" href="/decisions">
-            <i class="bi bi-diagram-3 me-1"></i>Decisions
+            <i class="bi bi-diagram-3 me-1"></i>{{ L('nav.decisions') }}
           </a>
         </li>
+        {% include "_lang_switch.html" %}
       </ul>
     </div>
   </div>
@@ -121,12 +53,49 @@
   {% block content %}{% endblock %}
 </div>
 
-<footer class="text-center text-secondary mt-5 mb-3" style="font-size:.78rem;">
-  Paper trading only &nbsp;·&nbsp; Dual-Agent System &nbsp;·&nbsp; Gemini 3 Flash + Claude Haiku
+{# Model names are read from the logs, not written here: the Gemini model is
+   picked at runtime from a fallback chain (or from agy), Claude answers on two
+   tiers, and the sentiment agent changes. A hand-written list went stale. #}
+<footer class="text-center mt-5 mb-3 hint">
+  <div>{{ t('footer.trader') }}</div>
+  {% if active_models %}
+  <div class="model-bar">
+    <span class="model-bar-label"><span class="model-dot"></span>{{ t('footer.models') }}</span>
+    {% for m in active_models %}<span class="model-chip mono" title="{{ m }}">{{ m }}</span>{% endfor %}
+  </div>
+  {% else %}
+  <div class="mt-1">{{ t('footer.models_none') }}</div>
+  {% endif %}
 </footer>
 
+{# The browser needs the same string table the templates use. #}
+<script id="i18n" type="application/json">{{ js_i18n | safe }}</script>
+<script>
+  const I18N = JSON.parse(document.getElementById('i18n').textContent);
+  const T = (k, vars) => {
+    let s = I18N[k] || k;
+    for (const [n, v] of Object.entries(vars || {})) s = s.split('{' + n + '}').join(v);
+    return s;
+  };
+</script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 {% block scripts %}{% endblock %}
+<script>
+// The language switch is a real navigation. Move the thumb on click and let the
+// transition play out before leaving, so the control answers immediately rather
+// than sitting inert until the new page paints. With reduced motion there is no
+// transition to wait for, so navigate at once.
+document.addEventListener('click', (e) => {
+  const opt = e.target.closest('.lang-switch .lang-opt:not(.active)');
+  if (!opt) return;
+  const box = opt.closest('.lang-switch');
+  box.dataset.lang = opt.dataset.targetLang;
+  box.querySelectorAll('.lang-opt').forEach(el => el.classList.toggle('active', el === opt));
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  e.preventDefault();
+  setTimeout(() => { window.location.href = opt.href; }, 140);
+});
+</script>
 </body>
 </html>

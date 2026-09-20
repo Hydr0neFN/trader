@@ -3,32 +3,32 @@
 {% block title %}History — Trader Dashboard{% endblock %}
 
 {% block content %}
-<h5 class="text-white mb-3"><i class="bi bi-clock-history me-2"></i>Trade History</h5>
+<h5 class="text-white mb-3"><i class="bi bi-clock-history me-2"></i>{{ L('sec.trade_history') }}</h5>
 
 <!-- Filters -->
 <div class="card mb-3">
   <div class="card-body py-2">
     <form class="row g-2 align-items-end" method="get">
       <div class="col-6 col-md-3">
-        <label class="form-label" style="font-size:.78rem;color:#8b949e;">Ticker</label>
+        <label class="form-label filter-label">{{ L('filter.ticker') }}</label>
         <select name="ticker" class="form-select form-select-sm bg-dark text-white border-secondary">
-          <option value="">All</option>
+          <option value="">{{ t('filter.all') }}</option>
           {% for t in all_tickers %}
           <option value="{{ t }}" {% if t == ticker_filter %}selected{% endif %}>{{ t }}</option>
           {% endfor %}
         </select>
       </div>
       <div class="col-6 col-md-3">
-        <label class="form-label" style="font-size:.78rem;color:#8b949e;">From</label>
+        <label class="form-label filter-label">{{ L('filter.from') }}</label>
         <input type="date" name="from" value="{{ date_from }}" class="form-control form-control-sm bg-dark text-white border-secondary">
       </div>
       <div class="col-6 col-md-3">
-        <label class="form-label" style="font-size:.78rem;color:#8b949e;">To</label>
+        <label class="form-label filter-label">{{ L('filter.to') }}</label>
         <input type="date" name="to" value="{{ date_to }}" class="form-control form-control-sm bg-dark text-white border-secondary">
       </div>
       <div class="col-6 col-md-3 d-flex gap-2">
-        <button type="submit" class="btn btn-primary btn-sm w-100">Filter</button>
-        <a href="/history" class="btn btn-outline-secondary btn-sm w-100">Reset</a>
+        <button type="submit" class="btn btn-primary btn-sm w-100">{{ t('filter.apply') }}</button>
+        <a href="/history" class="btn btn-outline-secondary btn-sm w-100">{{ t('filter.reset') }}</a>
       </div>
     </form>
   </div>
@@ -36,44 +36,30 @@
 
 {% if not rows %}
 <div class="card">
-  <div class="card-body text-center text-secondary py-5">
+  <div class="card-body text-center py-5 hint">
     <i class="bi bi-inbox display-4"></i>
-    <p class="mt-3">No trades match your filter.</p>
+    <p class="mt-3">{{ t('empty.no_trades_filter') }}</p>
   </div>
 </div>
 {% else %}
 <div class="card">
   <div class="table-responsive">
-    <table class="table table-dark table-hover mb-0 align-middle" id="historyTable" style="table-layout:fixed;word-break:break-word;">
-      <colgroup>
-        <col style="width:140px;"><!-- Time -->
-        <col style="width:64px;"> <!-- Ticker -->
-        <col style="width:90px;"> <!-- Action -->
-        <col style="width:90px;"> <!-- Verdict -->
-        <col style="width:48px;"> <!-- Qty -->
-        <col style="width:80px;"> <!-- Price -->
-        <col style="width:52px;"> <!-- Conf. -->
-        <col>                     <!-- Reasoning — takes remaining space -->
-      </colgroup>
-      <thead style="background:#1c2128; font-size:.8rem; text-transform:uppercase; letter-spacing:.5px; color:#8b949e;">
+    <table class="table table-dark table-hover mb-0 align-middle" id="historyTable">
+      <thead class="thead-sub">
         <tr>
-          <th class="ps-3">Time</th>
-          <th>Ticker</th>
-          <th>Action</th>
-          <th>Verdict</th>
-          <th class="text-end">Qty</th>
-          <th class="text-end">Price</th>
-          <th class="text-end">Conf.</th>
-          <th class="pe-3">Reasoning</th>
+          <th class="ps-3">{{ Lb('col.time') }}</th>
+          <th>{{ Lb('col.ticker') }}</th>
+          <th>{{ Lb('col.action') }}</th>
+          <th class="col-secondary">{{ Lb('col.verdict') }}</th>
+          <th class="text-end col-secondary">{{ Lb('col.qty') }}</th>
+          <th class="text-end">{{ Lb('col.price') }}</th>
+          <th class="text-end col-secondary pe-3">{{ Lb('col.confidence') }}</th>
         </tr>
       </thead>
       <tbody>
         {% for r in rows %}
-        <tr class="history-row" style="cursor:pointer;"
-            data-row='{{ row_json(r) | e }}'>
-          <td class="ps-3 text-secondary" style="white-space:nowrap;font-size:.8rem;">
-            {{ r.timestamp | fmt_ts }}
-          </td>
+        <tr class="history-row" style="cursor:pointer;" data-idx="{{ loop.index0 }}">
+          <td class="ps-3 hint" style="white-space:nowrap;">{{ r.timestamp | fmt_ts }}</td>
           <td class="fw-bold text-white">{{ r.ticker }}</td>
           <td>
             {% set act = r.action | upper %}
@@ -92,38 +78,48 @@
             </span>
             {% endif %}
           </td>
-          <td>
+          <td class="col-secondary">
             {% if r._type == 'vetoed' %}
               <span class="badge badge-veto"><i class="bi bi-x-circle me-1"></i>VETO</span>
             {% else %}
               <span class="badge badge-approved"><i class="bi bi-check-circle me-1"></i>APPROVED</span>
             {% endif %}
           </td>
-          <td class="text-end">{{ r.qty if r.qty is defined and r.qty != None else '—' }}</td>
-          <td class="text-end">
+          <td class="text-end mono col-secondary">{{ r.qty if r.qty is defined and r.qty != None else '—' }}</td>
+          <td class="text-end mono">
             {% if r.price is defined and r.price != None %}{{ r.price | fmt_currency }}{% else %}—{% endif %}
           </td>
-          <td class="text-end">
+          <td class="text-end mono col-secondary pe-3">
             {% if r.confidence is defined and r.confidence != None %}{{ r.confidence }}%{% else %}—{% endif %}
           </td>
-          <td class="pe-3 reasoning-text" style="max-width:260px;white-space:normal;word-break:break-word;overflow-wrap:anywhere;">{{ r.reasoning | default('—') | truncate(120) }}</td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
-  <div class="card-footer text-secondary" style="font-size:.78rem;">
-    {{ rows | length }} record(s) &nbsp;·&nbsp; <i class="bi bi-hand-index me-1"></i>Click a row to view full detail
+  <div class="card-footer hint">
+    {# The route caps the page at max_rows; say so rather than reporting the
+       capped number as if it were the whole match. #}
+    {% if total_matched > (rows | length) %}
+      {{ t('filter.records_capped', shown=rows | length, total=total_matched) }}
+    {% else %}
+      {{ t('filter.records', n=rows | length) }}
+    {% endif %}
+    &nbsp;·&nbsp; <i class="bi bi-hand-index me-1"></i>{{ t('hint.tap_row') }}
   </div>
 </div>
 {% endif %}
 
+{# One JSON blob for the whole page instead of a data- attribute per row: with
+   400 rows the per-row form pushed megabytes of escaped JSON into the DOM. #}
+<script id="rowData" type="application/json">{{ rows_json | safe }}</script>
+
 <!-- Detail modal -->
 <div class="modal fade" id="detailModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog modal-lg modal-dialog-scrollable">
-    <div class="modal-content" style="background:#161b22; border:1px solid #30363d;">
-      <div class="modal-header" style="border-color:#30363d;">
-        <h6 class="modal-title text-white" id="modalTitle">Trade Detail</h6>
+    <div class="modal-content" style="background:var(--card); border:1px solid var(--border);">
+      <div class="modal-header" style="border-color:var(--border);">
+        <h6 class="modal-title text-white" id="modalTitle">{{ t('modal.trade_detail') }}</h6>
         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body" id="modalBody" style="font-size:.85rem;overflow-x:hidden;"></div>
@@ -135,27 +131,29 @@
 {% block scripts %}
 <script>
 // ── Field display config ──────────────────────────────────────────────────────
+// Modal field labels. Keys with an entry in the shared i18n table follow the
+// page language; the rest are API field names that are clearer left as-is.
 const FIELD_LABELS = {
-  timestamp:           'Time',
+  timestamp:           T('col.time'),
   run_timestamp:       'Run Time',
-  ticker:              'Ticker',
-  action:              'Action',
+  ticker:              T('col.ticker'),
+  action:              T('col.action'),
   recommendation:      'Gemini Rec.',
-  final_action:        'Final Action',
+  final_action:        T('lbl.final_action'),
   gemini_recommendation: 'Gemini Rec.',
   gemini_confidence:   'Gemini Confidence',
   gemini_model:        'Gemini Model',
-  gemini_reasoning:    'Gemini Reasoning',
-  confidence:          'Confidence',
-  reasoning:           'Reasoning',
-  hf_sentiment:        'HF Sentiment',
-  hf_confidence:       'HF Confidence',
-  hf_model:            'HF Model',
-  hf_reasoning:        'HF Reasoning',
+  gemini_reasoning:    T('lbl.gemini_reasoning'),
+  confidence:          T('lbl.confidence'),
+  reasoning:           T('lbl.reasoning'),
+  hf_sentiment:        T('lbl.hf_sentiment'),
+  hf_confidence:       'Sentiment Confidence',
+  hf_model:            'Sentiment Model',
+  hf_reasoning:        'Sentiment Reasoning',
   haiku_verdict:       'Haiku Verdict',
-  haiku_justification: 'Haiku Justification',
-  veto_reasons:        'Veto Reasons',
-  qty:                 'Qty',
+  haiku_justification: T('lbl.haiku_justification'),
+  veto_reasons:        T('lbl.veto_reasons'),
+  qty:                 T('col.qty'),
   price:               'Fill Price',
   order_id:            'Order ID',
   exit_type:           'Exit Type',
@@ -166,24 +164,12 @@ const FIELD_LABELS = {
   current_price:       'Price at Run',
   daily_change_pct:    'Daily Change %',
   ma5:  'MA5',  ma20: 'MA20', ma50: 'MA50',
-  volume: 'Volume',
+  volume: T('lbl.volume'),
 };
 
-// Fields to render in the modal (order matters)
-const FIELD_ORDER = [
-  'timestamp','run_timestamp','ticker','recommendation','gemini_recommendation',
-  'gemini_confidence','gemini_model','gemini_reasoning',
-  'hf_sentiment','hf_confidence','hf_model','hf_reasoning',
-  'haiku_verdict','haiku_justification','veto_reasons',
-  'final_action','action',
-  'qty','price','order_id','exit_type',
-  'sim_sec_fee','sim_finra_taf','sim_slippage','sim_total_fee',
-  'confidence','reasoning',
-  'current_price','daily_change_pct','ma5','ma20','ma50','volume',
-];
 
 function fmtValue(key, val) {
-  if (val === null || val === undefined || val === '') return '<span class="text-secondary">—</span>';
+  if (val === null || val === undefined || val === '') return '<span class="hint">—</span>';
   if (Array.isArray(val)) {
     return val.map((v, i) =>
       `<div${i < val.length - 1 ? ' style="margin-bottom:6px;"' : ''}>${escHtml(String(v))}</div>`
@@ -243,22 +229,22 @@ function renderModal(row) {
   const mkeys = ['current_price','daily_change_pct','volume','ma5','ma20','ma50'].filter(k => k in row);
   if (mkeys.length) {
     html += `<div class="pipe-step info"><div class="pipe-ic"><i class="bi bi-bar-chart"></i></div>` +
-      `<div class="pipe-t">Market data at run</div><div class="pipe-card">${mkeys.map(k => kv(FIELD_LABELS[k]||k, k)).join('')}</div></div>`;
+      `<div class="pipe-t">${T('lbl.market_at_run')}</div><div class="pipe-card">${mkeys.map(k => kv(FIELD_LABELS[k]||k, k)).join('')}</div></div>`;
   }
 
-  // Stage 2 — AI analysis (Gemini + HF sentiment)
+  // Stage 2 — AI analysis (Gemini + sentiment)
   const gRec = pick('gemini_recommendation','recommendation','gemini_exit_action');
   const gConf = pick('gemini_confidence','confidence','gemini_exit_confidence');
   const gModel = pick('gemini_model','gemini_exit_model');
   const gReas = pick('gemini_reasoning','reasoning','gemini_exit_reasoning');
   const hfSent = pick('hf_sentiment');
   if (gRec || gReas || hfSent) {
-    html += `<div class="pipe-step info"><div class="pipe-ic"><i class="bi bi-cpu"></i></div><div class="pipe-t">AI analysis</div><div class="pipe-card">`;
+    html += `<div class="pipe-step info"><div class="pipe-ic"><i class="bi bi-cpu"></i></div><div class="pipe-t">${T('lbl.ai_analysis')}</div><div class="pipe-card">`;
     if (gRec || gConf || gModel || gReas) html += `<div class="mb-1"><i class="bi bi-stars me-1 text-info"></i><span class="fw-semibold text-white">Gemini</span></div>`;
-    html += kv('Recommendation', gRec) + kv('Confidence', gConf) + kv('Model', gModel) + longText('Reasoning', gReas);
+    html += kv(T('js.recommendation'), gRec) + kv(T('lbl.confidence'), gConf) + kv(T('lbl.model'), gModel) + longText(T('lbl.reasoning'), gReas);
     if (hfSent && String(row[hfSent]).toUpperCase() !== 'N/A') {
-      html += `<div class="mt-2 pt-2 border-top border-secondary-subtle"><i class="bi bi-newspaper me-1 text-warning"></i><span class="fw-semibold text-white">HF sentiment</span></div>`;
-      html += kv('Sentiment', hfSent) + kv('Confidence', pick('hf_confidence')) + longText('Reasoning', pick('hf_reasoning'));
+      html += `<div class="mt-2 pt-2 border-top border-secondary-subtle"><i class="bi bi-newspaper me-1 text-warning"></i><span class="fw-semibold text-white">Sentiment</span></div>`;
+      html += kv(T('js.sentiment'), hfSent) + kv(T('lbl.confidence'), pick('hf_confidence')) + longText(T('lbl.reasoning'), pick('hf_reasoning'));
     }
     html += `</div></div>`;
   }
@@ -269,8 +255,8 @@ function renderModal(row) {
   const vetoR = pick('veto_reasons');
   const vetoed = (row._type === 'vetoed') || (hVerdict && String(row[hVerdict]).toUpperCase() !== 'APPROVED');
   if (hVerdict || hJust || vetoR) {
-    html += `<div class="pipe-step ${vetoed ? 'no' : 'ok'}"><div class="pipe-ic"><i class="bi bi-shield-check"></i></div><div class="pipe-t">Risk gate — Claude Haiku</div><div class="pipe-card">`;
-    html += kv('Verdict', hVerdict) + longText('Justification', hJust) + longText('Veto reasons', vetoR);
+    html += `<div class="pipe-step ${vetoed ? 'no' : 'ok'}"><div class="pipe-ic"><i class="bi bi-shield-check"></i></div><div class="pipe-t">${T('lbl.risk_gate')}</div><div class="pipe-card">`;
+    html += kv(T('js.verdict'), hVerdict) + longText(T('js.justification'), hJust) + longText(T('lbl.veto_reasons'), vetoR);
     html += `</div></div>`;
   }
 
@@ -280,7 +266,7 @@ function renderModal(row) {
   if (skeys.length) {
     const fail = row._type === 'vetoed';
     html += `<div class="pipe-step ${fail ? 'no' : 'ok'}"><div class="pipe-ic"><i class="bi bi-wallet2"></i></div>` +
-      `<div class="pipe-t">Settlement</div><div class="pipe-card">${skeys.map(k => kv(FIELD_LABELS[k]||k, k)).join('')}</div></div>`;
+      `<div class="pipe-t">${T('lbl.settlement')}</div><div class="pipe-card">${skeys.map(k => kv(FIELD_LABELS[k]||k, k)).join('')}</div></div>`;
   }
 
   html += '</div>';
@@ -288,14 +274,14 @@ function renderModal(row) {
 }
 
 // Wire up row clicks
+const ROWS = JSON.parse(document.getElementById('rowData').textContent || '[]');
 const modal = new bootstrap.Modal(document.getElementById('detailModal'));
 document.querySelectorAll('.history-row').forEach(tr => {
   tr.addEventListener('click', function() {
-    try {
-      const row = JSON.parse(this.dataset.row);
-      renderModal(row);
-      modal.show();
-    } catch(e) { console.error('Detail parse error', e); }
+    const row = ROWS[Number(this.dataset.idx)];
+    if (!row) return;
+    renderModal(row);
+    modal.show();
   });
 });
 </script>

@@ -3,92 +3,57 @@
 
 {% block content %}
 {% if error %}
-<div class="alert alert-danger"><i class="bi bi-exclamation-triangle me-2"></i>Alpaca API error: {{ error }}</div>
+<div class="alert alert-danger"><i class="bi bi-exclamation-triangle me-2"></i>{{ t('err.alpaca', msg=error) }}</div>
 {% endif %}
 
-<!-- Stat cards -->
+{# Four cards, one row. The previous eight across three rows pushed the equity
+   curve below the fold on a phone; the four that were dropped are now the
+   sub-lines of the card they belong to. #}
 <div class="row g-3 mb-4">
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg-3">
     <div class="card stat-card h-100">
       <div class="card-body">
-        <div class="stat-label">Portfolio Value</div>
+        <div class="stat-label">{{ Lb('stat.portfolio_value') }}</div>
         <div class="stat-value text-white">{{ account.portfolio_value | fmt_currency }}</div>
+        <div class="stat-sub">{{ t('sub.cash', x=account.cash | fmt_currency) }}</div>
       </div>
     </div>
   </div>
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg-3">
     <div class="card stat-card h-100">
       <div class="card-body">
-        <div class="stat-label">Cash</div>
-        <div class="stat-value text-white">{{ account.cash | fmt_currency }}</div>
-      </div>
-    </div>
-  </div>
-  <div class="col-6 col-md-3">
-    <div class="card stat-card h-100">
-      <div class="card-body">
-        <div class="stat-label">Day P&amp;L</div>
-        <div class="stat-value {% if account.day_pnl is defined and account.day_pnl is not none and account.day_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
-          {{ account.day_pnl | fmt_currency }}
-          <small style="font-size:.9rem;">({{ account.day_pnl_pct | fmt_pct }})</small>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="col-6 col-md-3">
-    <div class="card stat-card h-100">
-      <div class="card-body">
-        <div class="stat-label">Total P&amp;L</div>
+        <div class="stat-label">{{ Lb('stat.total_pnl') }}</div>
         <div class="stat-value {% if account.total_pnl is defined and account.total_pnl is not none and account.total_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
           {{ account.total_pnl | fmt_currency }}
           <small style="font-size:.9rem;">({{ account.total_pnl_pct | fmt_pct }})</small>
         </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="row g-3 mb-4">
-  <div class="col-6 col-md-3">
-    <div class="card stat-card h-100">
-      <div class="card-body">
-        <div class="stat-label">Simulated Fees</div>
-        <div class="stat-value pnl-neg">
-          {{ cumulative_sim_fees | fmt_currency }}
-        </div>
-        <div style="font-size:.72rem; color:#8b949e; margin-top:4px;">SEC + FINRA TAF + slippage</div>
-      </div>
-    </div>
-  </div>
-  <div class="col-6 col-md-3">
-    <div class="card stat-card h-100">
-      <div class="card-body">
-        <div class="stat-label">Net P&amp;L <span style="font-size:.7rem;color:#8b949e;">(after sim fees)</span></div>
-        <div class="stat-value {% if net_pnl is defined and net_pnl is not none and net_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
-          {{ net_pnl | fmt_currency }}
+        <div class="stat-sub">
+          {{ t('sub.net_fees', net=net_pnl | fmt_currency, fees=cumulative_sim_fees | fmt_currency) }}
         </div>
       </div>
     </div>
   </div>
-</div>
-
-<div class="row g-3 mb-4">
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg-3">
     <div class="card stat-card h-100">
       <div class="card-body">
-        <div class="stat-label">Open Positions</div>
-        <div class="stat-value text-primary">{{ account.open_positions | default('—') }}</div>
+        <div class="stat-label">{{ Lb('stat.day_pnl') }}</div>
+        <div class="stat-value {% if account.day_pnl is defined and account.day_pnl is not none and account.day_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">
+          {{ account.day_pnl | fmt_currency }}
+          <small style="font-size:.9rem;">({{ account.day_pnl_pct | fmt_pct }})</small>
+        </div>
+        <div class="stat-sub">{{ t('sub.open_positions', n=account.open_positions | default('—')) }}</div>
       </div>
     </div>
   </div>
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg-3">
     <div class="card stat-card h-100">
       <div class="card-body">
-        <div class="stat-label">Last Run</div>
-        <div style="font-size:.85rem; color:#cdd9e5; margin-top:6px;">{{ last_run_ts | fmt_ts }}</div>
+        <div class="stat-label">{{ Lb('stat.last_run') }}</div>
+        <div class="stat-value text-white" style="font-size:1rem;line-height:1.5;">{{ last_run_ts | fmt_ts }}</div>
         {% if last_run %}
-        <div style="font-size:.78rem; color:#8b949e;">
-          ✓ {{ last_run.approved }} approved &nbsp;·&nbsp; ✗ {{ last_run.vetoed }} vetoed
+        <div class="stat-sub">
+          <span class="pnl-pos">✓ {{ t('sub.approved', n=last_run.approved) }}</span> &middot;
+          <span class="pnl-neg">✗ {{ t('sub.vetoed', n=last_run.vetoed) }}</span>
         </div>
         {% endif %}
       </div>
@@ -99,7 +64,7 @@
 <!-- Portfolio chart -->
 <div class="card mb-4">
   <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-    <span><i class="bi bi-bar-chart-line me-2"></i>Portfolio Value Over Time</span>
+    <span><i class="bi bi-bar-chart-line me-2"></i>{{ L('sec.portfolio_chart') }}</span>
     <div class="btn-group btn-group-sm" role="group" id="periodBtns">
       <button type="button" class="btn btn-outline-secondary" data-period="1D">1D</button>
       <button type="button" class="btn btn-outline-secondary" data-period="1W">1W</button>
@@ -112,11 +77,22 @@
       <canvas id="portfolioChart"></canvas>
     </div>
     {% if not chart_data or chart_data == '[]' %}
-    <p class="text-secondary text-center mt-3" style="font-size:.85rem;">
-      No history yet — data appears after the first completed trading run.
+    <p class="text-center mt-3 hint">
+      {{ t('empty.no_history') }}
     </p>
     {% endif %}
   </div>
+</div>
+
+{# Holdings used to be a separate /positions tab. On a solo dashboard "how am I
+   doing" and "what am I holding" are one question, so the table lives here. #}
+<div class="card mb-4">
+  <div class="card-header"><i class="bi bi-briefcase me-2"></i>{{ L('sec.open_positions') }}</div>
+  {% if positions_error %}
+  <div class="card-body"><div class="alert alert-danger mb-0">{{ positions_error }}</div></div>
+  {% else %}
+  {% include "_positions_table.html" with context %}
+  {% endif %}
 </div>
 {% endblock %}
 
@@ -184,12 +160,12 @@ function buildChart(data) {
           callbacks: {
             label: c => {
               if (c.datasetIndex === 1) {
-                return 'Peak: $' + c.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2});
+                return T('js.peak') + ': $' + c.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2});
               }
               const pk = hwm[c.dataIndex];
               const dd = c.parsed.y - pk;
-              const out = ['Value: $' + c.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2})];
-              if (dd < -0.01) out.push('Drawdown: ' + (dd / pk * 100).toFixed(2) + '%');
+              const out = [T('js.value') + ': $' + c.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2})];
+              if (dd < -0.01) out.push(T('js.drawdown') + ': ' + (dd / pk * 100).toFixed(2) + '%');
               return out;
             }
           }
@@ -197,12 +173,12 @@ function buildChart(data) {
       },
       scales: {
         x: {
-          ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 },
+          ticks: { color: '#9da7b3', maxTicksLimit: 8, maxRotation: 0 },
           grid:  { color: 'rgba(38,50,77,.5)' }
         },
         y: {
           ticks: {
-            color: '#8b949e',
+            color: '#9da7b3',
             callback: v => '$' + v.toLocaleString('en-US', {minimumFractionDigits:0})
           },
           grid: { color: 'rgba(38,50,77,.5)' }
@@ -234,5 +210,15 @@ if (allData.length > 0) {
     });
   });
 }
+
+// Inline 7-day sparkline per holding.
+document.querySelectorAll('.spark').forEach(el => {
+  const pts = (el.dataset.pts || '').split(',').map(Number).filter(n => !isNaN(n));
+  if (pts.length < 2) { el.textContent = '—'; el.classList.add('hint'); return; }
+  const w = 64, h = 20, min = Math.min(...pts), max = Math.max(...pts), span = (max - min) || 1;
+  const d = pts.map((v, i) => `${(i/(pts.length-1)*w).toFixed(1)},${(h-2-(v-min)/span*(h-4)).toFixed(1)}`).join(' ');
+  const col = el.dataset.up === '1' ? '#3fb950' : '#f85149';
+  el.innerHTML = `<svg width="${w}" height="${h}"><polyline fill="none" stroke="${col}" stroke-width="1.5" points="${d}"/></svg>`;
+});
 </script>
 {% endblock %}

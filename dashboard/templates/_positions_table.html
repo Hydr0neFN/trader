@@ -1,0 +1,63 @@
+{# Open-positions table. Rendered inside the overview; `rows` comes from the
+   same cached Alpaca call the stat cards use.
+
+   Small screens keep only the three columns that answer "what do I hold and is
+   it up or down" — the rest carry .col-secondary and are hidden under 576px so
+   the table never scrolls sideways. #}
+{% if not rows %}
+<div class="card-body text-center py-5 hint">
+  <i class="bi bi-inbox display-6 d-block mb-2"></i>{{ t('empty.no_positions') }}
+</div>
+{% else %}
+<div class="table-responsive">
+  <table class="table table-dark table-hover mb-0 align-middle">
+    <thead class="thead-sub">
+      <tr>
+        <th class="ps-3">{{ Lb('col.ticker') }}</th>
+        <th class="col-secondary">{{ Lb('col.side') }}</th>
+        <th class="text-end col-secondary">{{ Lb('col.avg_entry') }}</th>
+        <th class="text-end">{{ Lb('col.current') }}</th>
+        <th class="text-center col-secondary">{{ Lb('col.trend_7d') }}</th>
+        <th class="text-end col-secondary">{{ Lb('col.market_value') }}</th>
+        <th class="text-end col-secondary" style="min-width:120px;">{{ Lb('col.allocation') }}</th>
+        <th class="text-end pe-3">{{ Lb('col.unrealized_pnl') }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="ps-3">
+          <span class="fw-bold text-white">{{ r.symbol }}</span>
+          {# Qty folded in under the ticker: it was a column of its own that
+             cost width on every screen and is only ever read next to entry. #}
+          <span class="d-block mono hint">{{ r.qty | int }} @ {{ r.avg_entry | fmt_currency }}</span>
+        </td>
+        <td class="col-secondary">
+          <span class="badge {% if r.side == 'LONG' %}badge-buy{% else %}badge-sell{% endif %}">{{ r.side }}</span>
+        </td>
+        <td class="text-end mono col-secondary">{{ r.avg_entry | fmt_currency }}</td>
+        <td class="text-end mono">{{ r.current | fmt_currency }}</td>
+        <td class="text-center col-secondary">
+          <span class="spark" data-pts="{{ r.spark | join(',') }}" data-up="{% if r.unreal_pl >= 0 %}1{% else %}0{% endif %}"></span>
+        </td>
+        <td class="text-end mono col-secondary">{{ r.market_value | fmt_currency }}</td>
+        <td class="text-end col-secondary">
+          <div class="d-flex align-items-center justify-content-end gap-2">
+            <div class="alloc-bar flex-grow-1" style="max-width:70px;"><span style="width:{{ r.allocation | round(1) }}%;"></span></div>
+            <span class="mono text-white" style="font-size:.8rem; min-width:40px;">{{ r.allocation | round(1) }}%</span>
+          </div>
+        </td>
+        <td class="text-end pe-3">
+          {% set pct = r.unreal_plpct %}
+          {% if pct >= 5 %}{% set hc = 'pos3' %}{% elif pct >= 1 %}{% set hc = 'pos2' %}{% elif pct >= 0 %}{% set hc = 'pos1' %}{% elif pct <= -5 %}{% set hc = 'neg3' %}{% elif pct <= -1 %}{% set hc = 'neg2' %}{% else %}{% set hc = 'neg1' %}{% endif %}
+          <span class="pl-heat {{ hc }}">
+            <span class="v mono">{{ r.unreal_pl | fmt_currency }}</span>
+            <span class="p mono">{{ r.unreal_plpct | fmt_pct }}</span>
+          </span>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
