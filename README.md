@@ -50,6 +50,7 @@ absence of data must be stated, not hallucinated.
 
 ## Safety rails (LLM-independent)
 
+<!-- RAILS:START -->
 | Rail | Default | Env override |
 |------|---------|--------------|
 | Hard stop-loss | 5% | `STOP_LOSS_PCT` |
@@ -60,6 +61,22 @@ absence of data must be stated, not hallucinated.
 | Cash floor never spent | $500 | `CASH_RESERVE_USD` |
 | Minimum size for a cash-trimmed order | $750 | `MIN_TRADE_USD` |
 | Tickers per batch | 10 | `TICKER_BATCH_SIZE` |
+| Analyst confidence floor | 70% | — (hardcoded) |
+<!-- RAILS:END -->
+
+The table above is generated, not typed: `tools/readme_rails.py` reads the
+defaults out of `trader.py` and rewrites the block between the `RAILS` markers.
+Run `--check` before committing (exit 1 on drift) and `--write` to regenerate.
+Every stale number this project has published — a hardcoded `/20` on the GitHub
+profile, a hand-written model list in the dashboard footer — was a value someone
+had copied. Copying is the bug; deriving is the fix.
+
+
+A BUY or SELL below the confidence floor is vetoed with the reason recorded, the
+same way a Haiku veto or a contradicting sentiment read is. It has no env
+override on purpose: measurement across this bot's own history found the
+confidence score has no predictive value for outcome, so it is kept as a crude
+floor rather than promoted to a ranking key.
 
 Position sizing is a percentage of *portfolio value*, which says nothing about
 settled cash. Until the **cash guard** was added, `MAX_POSITIONS x
@@ -94,6 +111,7 @@ Keys required in `~/.env`: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `GEMINI_API_KE
 `CLOUDFLARE_API_TOKEN` (the token needs only **Account > Workers AI > Read**) to give
 the sentiment leg a free fallback on a separate billing rail. Without them the leg is
 Hugging Face only, and a spent credit balance takes the whole thing down at once.
+`HF_SENTIMENT_MODEL` overrides the primary model without touching the code.
 
 **Optional — Claude Sonnet via subscription.** To run the risk/exit gate on Claude
 **Sonnet** through the Claude Agent SDK — drawing on your **Claude Pro plan's
@@ -140,11 +158,36 @@ via Alpaca's clock endpoint), so it exits early when the market is closed.
 `flock -n` keeps overlapping runs from stacking up if one is slow. Adjust the hour
 range to your server's timezone — the bot self-enforces the ET window regardless.
 
+Arm `healthcheck.py` on the same cadence. It is external on purpose: the outage
+that motivated it crashed `trader.py` at *import* time, before any in-process
+guard could run, so the only durable signal is whether a run finished recently.
+It raises two independent alarms — **stale**, when `run_log.jsonl` stops
+advancing during market hours, and **degraded**, when a run completed but the
+whole sentiment chain fell through and every ticker was scored NEUTRAL/0. The
+second is rate-limited and deliberately leaves the stale marker and the exit
+code alone, because the bot is alive; it is just flying blind.
+
+```cron
+*/30 9-15 * * 1-5 HEALTHCHECK_NTFY_TOPIC=your-topic /usr/bin/python3 /path/to/healthcheck.py
+```
+
+Tunables: `HEALTHCHECK_MAX_AGE_MIN` (default 90), `HEALTHCHECK_DEGRADED_REALERT_H`
+(default 12), `HEALTHCHECK_NTFY_TOPIC`, `HEALTHCHECK_WEBHOOK`. With no channel
+configured it still writes `trade_logs/healthcheck.log` and drops a marker file,
+and sends nothing outward.
+
 ## Dashboard
 
-A small Flask app in `dashboard/` shows positions, decisions, and history. The
+A small Flask app in `dashboard/` shows positions, decisions, and history, in
+**zh-TW and English** (switch at `/lang/<code>`; strings live in `i18n.py`). The
 overview page charts portfolio value over time with a **high-water-mark line and
-drawdown shading**.
+drawdown shading**, and carries the holdings table — `/positions` is kept as a
+redirect to `/` so old links still work.
+
+Model names in the footer and on the decision cards are derived from the logs at
+render time, never hand-written, so they cannot drift from what the bot actually
+called. Labels name the role (`Sentiment`) rather than the vendor, for the same
+reason: the provider behind that leg changes.
 
 ```bash
 python3 dashboard/app.py
@@ -155,10 +198,13 @@ python3 dashboard/app.py
 ```
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
 llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
+tools/readme_rails.py  # derives the safety-rail table from trader.py (--check / --write)
 healthcheck.py         # run-freshness + degraded-LLM check, notifies via ntfy
 requirements.txt
 dashboard/
   app.py               # Flask dashboard
-  templates/           # overview, positions, decisions, history
+  i18n.py              # zh-TW / EN string table (shared byte-for-byte with DOWTrade)
+  static/theme.css
+  templates/           # overview, decisions, history + _lang_switch, _positions_table
 .env.example           # credential template (real keys live in ~/.env, never committed)
 ```

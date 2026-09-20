@@ -23,6 +23,7 @@
 
 ## 安全防護機制（獨立於 LLM）
 
+<!-- RAILS:START -->
 | 防護機制 | 預設值 | 環境變數覆寫 |
 |------|---------|--------------|
 | 強制停損 | 5% | `STOP_LOSS_PCT` |
@@ -33,6 +34,13 @@
 | 永不動用的現金底線 | $500 | `CASH_RESERVE_USD` |
 | 現金裁切後的最小下單金額 | $750 | `MIN_TRADE_USD` |
 | 每批股票代碼數 | 10 | `TICKER_BATCH_SIZE` |
+| 分析師信心度門檻 | 70% | —（寫死） |
+<!-- RAILS:END -->
+
+上面那張表是產生出來的，不是手打的：`tools/readme_rails.py` 會從 `trader.py` 讀出預設值，重寫 `RAILS` 標記之間的區塊。提交前先跑 `--check`（有漂移就 exit 1），要重新產生則用 `--write`。這個專案過去發布出去的每一個過期數字 —— GitHub 主頁寫死的 `/20`、儀表板頁尾手寫的模型清單 —— 都是某個被抄過去的值。抄寫本身就是 bug，推導才是解法。
+
+
+信心度低於門檻的 BUY 或 SELL 會被否決並記下理由，與 Haiku 否決或情緒指標相牴觸的處理方式相同。這一條刻意不提供環境變數覆寫：針對本機器人自身歷史的量測顯示，信心度分數對結果沒有預測力，因此它只保留為一道粗略的門檻，而不會被提升為排序依據。
 
 倉位規模是以*投資組合總值*的百分比計算，這個數字完全不反映已交割的現金。在加入**現金防護**之前，`MAX_POSITIONS x POSITION_SIZE_PCT <= 100%` 是唯一阻止機器人動用融資的機制 — 而模擬帳戶通常配有約 4 倍的購買力，因此超出預算的訂單不會失敗，而是靜靜地用借來的錢成交。`execute_trades()` 現在會在整輪執行中追蹤可動用現金，把訂單裁切到現金足以支應的數量，並在現金耗盡時記錄 `SKIPPED_CASH`。前一輪遺留的未成交買單會先從現金與持倉槽兩邊的預算扣除再重新分配，因為 Alpaca 是在成交而非送單時才扣現金。賣出會排在買入之前處理並把所得回補，讓滿倉狀態仍能換股；裁切後低於 `MIN_TRADE_USD` 的單會直接跳過，不讓零碎部位佔掉一個持倉槽。
 
@@ -47,7 +55,7 @@ cp .env.example ~/.env        # fill in your keys
 
 `~/.env` 中所需金鑰：`ALPACA_API_KEY`、`ALPACA_SECRET_KEY`、`GEMINI_API_KEY`、`ANTHROPIC_API_KEY`、`HF_API_TOKEN`。詳見 `.env.example`。
 
-**建議設定 — Cloudflare Workers AI 後備。** 設定 `CLOUDFLARE_ACCOUNT_ID` 與 `CLOUDFLARE_API_TOKEN`（token 只需要 **Account > Workers AI > Read** 權限），可為情緒分析這一段提供架在不同計費管道上的免費後備。未設定時該段只剩 Hugging Face，額度一旦耗盡整段會同時失效。
+**建議設定 — Cloudflare Workers AI 後備。** 設定 `CLOUDFLARE_ACCOUNT_ID` 與 `CLOUDFLARE_API_TOKEN`（token 只需要 **Account > Workers AI > Read** 權限），可為情緒分析這一段提供架在不同計費管道上的免費後備。未設定時該段只剩 Hugging Face，額度一旦耗盡整段會同時失效。`HF_SENTIMENT_MODEL` 可在不改程式碼的情況下覆寫主要模型。
 
 **選用 — 透過訂閱使用 Claude Sonnet。** 若要透過 Claude Agent SDK 在 Claude **Sonnet** 上執行風險／出場關卡 — 運用您的 **Claude Pro 方案內含額度**而非按用量計費的 Haiku API token — 請新增 `CLAUDE_CODE_OAUTH_TOKEN`（來自 `claude setup-token`）。可微調參數：`CLAUDE_SDK_FOR`（`exits` [預設] | `all` | `none`）與 `CLAUDE_SDK_MODEL`（預設 `sonnet`）。若無 token，機器人將如以往般僅以 Haiku 執行。
 
@@ -75,7 +83,9 @@ python3 trader.py
 
 ## 儀表板
 
-位於 `dashboard/` 的小型 Flask 應用程式，用於顯示倉位、決策與歷史紀錄。總覽頁面繪製投資組合價值隨時間變化的圖表，並帶有**歷史高點線與回撤陰影**。
+位於 `dashboard/` 的小型 Flask 應用程式，用於顯示倉位、決策與歷史紀錄，提供**繁體中文與英文**兩種語言（於 `/lang/<code>` 切換，字串集中在 `i18n.py`）。總覽頁面繪製投資組合價值隨時間變化的圖表，並帶有**歷史高點線與回撤陰影**，持倉表格也已併入該頁 —— `/positions` 保留為導向 `/` 的轉址，舊連結仍然可用。
+
+頁尾與決策卡片上的模型名稱是在算繪當下從 log 推導出來的，不是手寫的，因此不可能與機器人實際呼叫的模型脫節。標籤描述的是**角色**（`Sentiment`）而非**廠商**，理由相同：那一段背後的供應商會換。
 
 ```bash
 python3 dashboard/app.py
@@ -86,10 +96,13 @@ python3 dashboard/app.py
 ```
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
 llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
+tools/readme_rails.py  # derives the safety-rail table from trader.py (--check / --write)
 healthcheck.py         # run-freshness + degraded-LLM check, notifies via ntfy
 requirements.txt
 dashboard/
   app.py               # Flask dashboard
-  templates/           # overview, positions, decisions, history
+  i18n.py              # zh-TW / EN string table (shared byte-for-byte with DOWTrade)
+  static/theme.css
+  templates/           # overview, decisions, history + _lang_switch, _positions_table
 .env.example           # credential template (real keys live in ~/.env, never committed)
 ```
