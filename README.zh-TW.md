@@ -12,7 +12,7 @@
 
 1. **市場數據 + 新聞** — 透過 yfinance 取得價格歷史，透過 Alpaca 新聞 API 取得新聞標題。
 2. **分析師**（Gemini）— 附帶信心度與理由的 BUY/SELL/HOLD 建議。沿著模型優先順序鏈（`gemini-3.8-flash` → `gemini-3.6-flash` → … → `gemini-3.1-flash-lite`）依序嘗試，以便在某個模型遇到額度限制時能平穩降級。
-3. **情緒分析**（Hugging Face）— BULLISH/BEARISH/NEUTRAL 的第二意見。僅在與分析師**直接衝突**時（BUY 對上 BEARISH，或 SELL 對上 BULLISH）才會阻擋交易；NEUTRAL（無重大新聞／空白新聞）不會行使否決權。
+3. **情緒分析**（DeepSeek → Cloudflare Workers AI）— BULLISH/BEARISH/NEUTRAL 的第二意見。僅在與分析師**直接衝突**時（BUY 對上 BEARISH，或 SELL 對上 BULLISH）才會阻擋交易；NEUTRAL（無重大新聞／空白新聞）不會行使否決權。模型鏈為 Hugging Face 的 `deepseek-ai/DeepSeek-V4.1-Flash`，接著是 Cloudflare Workers AI 的 `@cf/mistralai/mistral-small-3.1-24b-instruct` 與 `@cf/meta/llama-4-scout-17b-16e-instruct`。兩個後備刻意架在**不同的計費管道**上：舊的模型鏈四個全在 Hugging Face，額度一旦耗盡，四個會同時回傳 402。Cloudflare 免費層每日 10,000 Neurons，約等於 900 次情緒呼叫，因此在 Hugging Face 額度見底時這一段仍然存活。把答案放進 `reasoning` 而讓 `content` 空白的模型在此無法使用，排除依據是實測，不是名氣。
 4. **風險控管**（Claude）— 最終關卡；否決不安全的交易。在關鍵的出場決策上透過 Claude Agent SDK 使用 **Sonnet** — 運用您 **Claude Pro 方案內含額度** — 並使用 **Haiku** API 進行大批量的買入篩選；未設定訂閱 token 時會退回使用 Haiku。
 5. **執行** — Alpaca 模擬訂單；強制停損底線**與保護利潤的移動停損**皆獨立於 LLM 強制執行。
 6. **出場分析** — 未平倉部位由 Gemini 出場分析師與 Claude 出場風險關卡重新評估。設定 `USE_AGY_GEMINI=1` 時，出場分析師會透過 Antigravity CLI 使用 Google AI **訂閱**額度，任何失敗都會退回 Gemini API 鏈；未設定時則直接使用 API 鏈。（Google 於 2026-06-18 停用了個人層級的 `gemini-cli`；該路徑預設關閉 — 僅在具備付費金鑰支援的 CLI 時才設定 `USE_GEMINI_EXIT_CLI=1`。）
@@ -30,7 +30,10 @@
 | 移動停損啟動條件（啟動前所需漲幅） | 3% | `TRAIL_ACTIVATE_PCT` |
 | 倉位規模 | 淨值的 2% | `POSITION_SIZE_PCT` |
 | 最大同時持倉數 | 8 | `MAX_POSITIONS` |
+| 永不動用的現金底線 | $500 | `CASH_RESERVE_USD` |
 | 每批股票代碼數 | 10 | `TICKER_BATCH_SIZE` |
+
+倉位規模是以*投資組合總值*的百分比計算，這個數字完全不反映已交割的現金。在加入**現金防護**之前，`MAX_POSITIONS x POSITION_SIZE_PCT <= 100%` 是唯一阻止機器人動用融資的機制 — 而模擬帳戶通常配有約 4 倍的購買力，因此超出預算的訂單不會失敗，而是靜靜地用借來的錢成交。`execute_trades()` 現在會在整輪執行中追蹤可動用現金，把訂單裁切到現金足以支應的數量，並在現金耗盡時記錄 `SKIPPED_CASH`。賣出所得不會在同一輪內回補，因為在成交確認之前那筆錢尚未交割。
 
 **移動停損**僅在倉位的即時高點漲幅超越進場價 `TRAIL_ACTIVATE_PCT` 之後才會啟動，隨後在自該高點回檔 `TRAIL_STOP_PCT` 時出場 — 在獲利標的上鎖定收益，同時保留強制停損底線來管理從未上漲的標的。高點紀錄會持久化儲存在 `trade_logs/position_peaks.json` 中，並在每次執行時進行取樣。
 
@@ -42,6 +45,8 @@ cp .env.example ~/.env        # fill in your keys
 ```
 
 `~/.env` 中所需金鑰：`ALPACA_API_KEY`、`ALPACA_SECRET_KEY`、`GEMINI_API_KEY`、`ANTHROPIC_API_KEY`、`HF_API_TOKEN`。詳見 `.env.example`。
+
+**建議設定 — Cloudflare Workers AI 後備。** 設定 `CLOUDFLARE_ACCOUNT_ID` 與 `CLOUDFLARE_API_TOKEN`（token 只需要 **Account > Workers AI > Read** 權限），可為情緒分析這一段提供架在不同計費管道上的免費後備。未設定時該段只剩 Hugging Face，額度一旦耗盡整段會同時失效。
 
 **選用 — 透過訂閱使用 Claude Sonnet。** 若要透過 Claude Agent SDK 在 Claude **Sonnet** 上執行風險／出場關卡 — 運用您的 **Claude Pro 方案內含額度**而非按用量計費的 Haiku API token — 請新增 `CLAUDE_CODE_OAUTH_TOKEN`（來自 `claude setup-token`）。可微調參數：`CLAUDE_SDK_FOR`（`exits` [預設] | `all` | `none`）與 `CLAUDE_SDK_MODEL`（預設 `sonnet`）。若無 token，機器人將如以往般僅以 Haiku 執行。
 
@@ -80,7 +85,7 @@ python3 dashboard/app.py
 ```
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
 llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
-healthcheck.py         # run-freshness check, notifies via ntfy
+healthcheck.py         # run-freshness + degraded-LLM check, notifies via ntfy
 requirements.txt
 dashboard/
   app.py               # Flask dashboard

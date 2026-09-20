@@ -41,7 +41,11 @@ LOG_DIR      = Path(os.environ.get("TRADER_LOG_DIR", Path.home() / "trade_logs")
 RUN_LOG      = LOG_DIR / "run_log.jsonl"
 HEALTH_LOG   = LOG_DIR / "healthcheck.log"
 STALE_MARKER = LOG_DIR / "STALE"
+DEGRADED_MARKER = LOG_DIR / "DEGRADED"
 MAX_AGE_MIN  = int(os.environ.get("HEALTHCHECK_MAX_AGE_MIN", "90"))
+# Re-alert on a still-degraded LLM chain at most this often, so a multi-day
+# outage is loud on day one without spamming every 30 min after that.
+DEGRADED_REALERT_H = int(os.environ.get("HEALTHCHECK_DEGRADED_REALERT_H", "12"))
 ET           = ZoneInfo("America/New_York")
 
 
@@ -76,6 +80,75 @@ def last_run_log_ts() -> datetime | None:
         return datetime.fromisoformat(ts) if ts else None
     except (ValueError, json.JSONDecodeError):
         return None
+
+
+def last_run_complete() -> dict | None:
+    """The newest `run_complete` record, or None if there is not one."""
+    if not RUN_LOG.exists():
+        return None
+    found = None
+    try:
+        for line in RUN_LOG.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("event") == "run_complete":
+                found = rec
+    except OSError:
+        return None
+    return found
+
+
+def notify_degraded(msg: str) -> None:
+    """Alert that the bot is running but an LLM leg is dead.
+
+    Separate from notify(): trader.py is alive, so this must not raise the
+    STALE marker or change the exit code. Rate-limited via its own marker
+    file -- the 2026-09 HuggingFace 402 outage ran 5 days with nothing but
+    WARNING lines in cron.log, which is exactly what this closes.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        prev = datetime.fromisoformat(DEGRADED_MARKER.read_text().split()[0])
+        if (now - prev).total_seconds() < DEGRADED_REALERT_H * 3600:
+            return
+    except (OSError, ValueError, IndexError):
+        pass
+
+    ts = now.isoformat()
+    try:
+        with HEALTH_LOG.open("a") as f:
+            f.write(f"{ts} DEGRADED {msg}\n")
+        DEGRADED_MARKER.write_text(f"{ts} {msg}\n")
+    except OSError:
+        pass
+
+    topic = os.environ.get("HEALTHCHECK_NTFY_TOPIC")
+    if topic:
+        try:
+            req = urllib.request.Request(
+                f"https://ntfy.sh/{topic}",
+                data=msg.encode(),
+                headers={"Title": "trader degraded", "Priority": "default"},
+            )
+            urllib.request.urlopen(req, timeout=15)
+        except Exception:
+            pass
+
+    hook = os.environ.get("HEALTHCHECK_WEBHOOK")
+    if hook:
+        try:
+            req = urllib.request.Request(
+                hook,
+                data=json.dumps({"text": msg}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=15)
+        except Exception:
+            pass
 
 
 def notify(msg: str) -> None:
@@ -128,6 +201,21 @@ def main() -> int:
         notify(f"trader stale: last run_log line {age_min:.0f} min ago "
                f"(>{MAX_AGE_MIN}) — cron/import likely broken")
         return 1
+
+    # Fresh, but the run may still have flown blind: a total sentiment-chain
+    # failure leaves every ticker at NEUTRAL/0 without stopping the run.
+    rec = last_run_complete() or {}
+    fails = rec.get("sentiment_failures", 0)
+    if fails:
+        notify_degraded(
+            f"sentiment LLM chain down: {fails} ticker(s) fell through every "
+            f"provider (HF + Cloudflare) last run — trading on price data only"
+        )
+    else:
+        try:
+            DEGRADED_MARKER.unlink()
+        except OSError:
+            pass
 
     # Healthy — clear any prior stale marker.
     try:

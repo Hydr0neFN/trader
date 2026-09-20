@@ -79,6 +79,9 @@ PEAKS_FILE = LOG_DIR / "position_peaks.json"
 # Position sizing — override via .env
 MAX_POSITION_PCT  = float(os.environ.get("POSITION_SIZE_PCT", "2")) / 100  # 2% per trade
 MAX_POSITIONS     = int(os.environ.get("MAX_POSITIONS",       "8"))
+# Cash floor kept unspent, so a market order that slips between sizing and
+# fill cannot tip the account onto margin.
+CASH_RESERVE_USD  = float(os.environ.get("CASH_RESERVE_USD", "500"))
 TICKER_BATCH_SIZE = int(os.environ.get("TICKER_BATCH_SIZE",   "10"))
 
 COMPANY_NAMES = {
@@ -417,23 +420,50 @@ SENTIMENT_SYSTEM = (
     "or reference any news events that are not explicitly listed in the input."
 )
 
-# Tried in order — falls back if a model is overloaded or unavailable.
-HF_SENTIMENT_MODELS = [
-    "deepseek-ai/DeepSeek-V3.2-Exp",
-    "Qwen/Qwen3-8B",   # Qwen3 merged instruct into the base repo; -Instruct 404s
-    "meta-llama/Llama-3.3-70B-Instruct",
-    "mistralai/Mixtral-8x7B-Instruct-v0.1",  # last resort
+# Provider chain: HuggingFace first (DeepSeek V4.1-Flash), then Cloudflare
+# Workers AI as a free fallback. The HF free tier returns 402 for *every*
+# model once the monthly credit allowance is spent, so the old all-HF chain
+# died as a unit -- it had been failing since 2026-09-15 unnoticed.
+HF_SENTIMENT_MODEL = os.environ.get("HF_SENTIMENT_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
+
+# Workers AI free plan, OpenAI-compatible endpoint. Both picked by measured
+# accuracy and schema compliance: models that answer in `reasoning` and leave
+# `content` empty (gpt-oss, glm-4.7-flash, nemotron-3, gemma-4, qwen3-30b) are
+# unusable here -- json.loads() gets "".
+CF_SENTIMENT_MODELS = [
+    "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "@cf/meta/llama-4-scout-17b-16e-instruct",
 ]
+CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CF_API_TOKEN  = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+
+# Counts runs where the whole sentiment chain fell over, surfaced in run_log so
+# healthcheck.py can alert -- the 2026-09 outage went 5 days unnoticed because
+# a total LLM failure only ever produced a WARNING line nobody read.
+SENTIMENT_STATE = {"failures": 0}
+
+
+def _sentiment_providers():
+    """(client, model) in priority order: HF primary, Cloudflare free fallback."""
+    yield HFClient(token=HF_API_TOKEN), HF_SENTIMENT_MODEL
+    if CF_ACCOUNT_ID and CF_API_TOKEN:
+        # Cloudflare Workers AI speaks the OpenAI chat-completions schema, so
+        # the same client call shape works with a swapped base_url.
+        cf = HFClient(
+            base_url=f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1",
+            token=CF_API_TOKEN,
+        )
+        for model in CF_SENTIMENT_MODELS:
+            yield cf, model
 
 
 def run_sentiment_analyst(data_block: str) -> dict:
-    client = HFClient(token=HF_API_TOKEN)
     last_exc = None
 
-    for model in HF_SENTIMENT_MODELS:
+    for prov_client, model in _sentiment_providers():
         try:
-            def call(m=model):
-                resp = client.chat_completion(
+            def call(m=model, c=prov_client):
+                resp = c.chat_completion(
                     model=m,
                     messages=[
                         {"role": "system", "content": SENTIMENT_SYSTEM},
@@ -442,7 +472,11 @@ def run_sentiment_analyst(data_block: str) -> dict:
                     max_tokens=250,
                     temperature=0.1,
                 )
-                raw    = resp.choices[0].message.content
+                raw    = resp.choices[0].message.content or ""
+                if not raw.strip():
+                    # Reasoning-only models answer in `reasoning` and leave
+                    # `content` empty; that is a failure for our JSON schema.
+                    raise ValueError("empty content (reasoning-only response)")
                 result = json.loads(strip_json_fences(raw))
                 sentiment = result.get("sentiment", "NEUTRAL").upper()
                 if sentiment not in ("BULLISH", "BEARISH", "NEUTRAL"):
@@ -457,12 +491,13 @@ def run_sentiment_analyst(data_block: str) -> dict:
             return retry(call, retries=1, delay=3.0)
 
         except Exception as exc:
-            log.warning("HF model %s failed (%s) -- trying next...", model, str(exc)[:60])
+            log.warning("Sentiment model %s failed (%s) -- trying next...", model, str(exc)[:60])
             last_exc = exc
             continue
 
-    log.error("All HF sentiment models failed: %s", last_exc)
-    return {"sentiment": "NEUTRAL", "confidence": 0, "reasoning": "HF agent unavailable", "model": "none"}
+    SENTIMENT_STATE["failures"] += 1
+    log.error("All sentiment models failed (HF + Cloudflare): %s", last_exc)
+    return {"sentiment": "NEUTRAL", "confidence": 0, "reasoning": "sentiment agent unavailable", "model": "none"}
 
 
 # ── Claude router: Sonnet via SDK (subscription) → Haiku via API fallback ─────
@@ -1079,6 +1114,15 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
     portfolio_val = float(account.portfolio_value)
     max_trade_val = portfolio_val * MAX_POSITION_PCT
 
+    # Sizing above is a percentage of portfolio value and knows nothing about
+    # settled cash, so MAX_POSITIONS * POSITION_SIZE_PCT <= 100% used to be the
+    # only thing holding the bot off margin. Alpaca hands this account ~4x
+    # buying power, so an over-budget order fills silently on borrowed money
+    # instead of failing -- the guard has to be explicit. Drawn down as orders
+    # go out; sell proceeds are deliberately not credited back mid-run, since
+    # they are unsettled until the fill lands.
+    cash_remaining = float(account.cash) - CASH_RESERVE_USD
+
     positions  = {p.symbol: p for p in client.get_all_positions()}
     open_count = len(positions)
     pending    = open_order_symbols(client)   # tickers with an unfilled order
@@ -1108,6 +1152,18 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                          ticker, price, max_trade_val)
                 status[ticker] = "SKIPPED_BUDGET"
                 continue
+
+            # Trim to what cash covers rather than borrowing the difference.
+            if qty * price > cash_remaining:
+                affordable = int(cash_remaining / price)
+                if affordable < 1:
+                    log.info("SKIP %s BUY: cash exhausted ($%.2f spendable, share $%.2f)",
+                             ticker, cash_remaining, price)
+                    status[ticker] = "SKIPPED_CASH"
+                    continue
+                log.info("TRIM %s BUY %d -> %d share(s): cash-limited ($%.2f spendable)",
+                         ticker, qty, affordable, cash_remaining)
+                qty = affordable
             try:
                 order = client.submit_order(MarketOrderRequest(
                     symbol=ticker,
@@ -1131,6 +1187,7 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                 log.info("BUY  %dx %s @ ~$%.2f | sim_fee=$%.4f | order %s",
                          qty, ticker, price, fees["sim_total_fee"], order.id)
                 open_count += 1
+                cash_remaining -= qty * price
                 bought.add(ticker)
                 status[ticker] = "EXECUTED"
             except Exception as exc:
@@ -1997,6 +2054,7 @@ def main() -> None:
         "tickers_skipped":     [t for t in TICKERS if t not in data_map],
         "api_calls":           api_calls,
         "cumulative_sim_fees": cumulative_sim_fees,
+        "sentiment_failures":  SENTIMENT_STATE["failures"],
     })
     log.info("=== Run complete ===")
 

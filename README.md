@@ -17,9 +17,18 @@ Each run (every 30 min, 9:30–16:00 ET, weekdays) executes a pipeline per ticke
 2. **Analyst** (Gemini) — BUY/SELL/HOLD recommendation with confidence + reasoning.
    Walks a model-priority chain (`gemini-3.8-flash` → `gemini-3.6-flash` → … →
    `gemini-3.1-flash-lite`) so it degrades gracefully when a model is quota-gated.
-3. **Sentiment** (Hugging Face) — BULLISH/BEARISH/NEUTRAL second opinion. It only
-   blocks a trade when it **directly contradicts** the analyst (BUY vs BEARISH, or
-   SELL vs BULLISH); NEUTRAL (quiet/empty news) does not veto.
+3. **Sentiment** (DeepSeek → Cloudflare Workers AI) — BULLISH/BEARISH/NEUTRAL
+   second opinion. It only blocks a trade when it **directly contradicts** the
+   analyst (BUY vs BEARISH, or SELL vs BULLISH); NEUTRAL (quiet/empty news) does
+   not veto. The chain is `deepseek-ai/DeepSeek-V4.1-Flash` on Hugging Face, then
+   `@cf/mistralai/mistral-small-3.1-24b-instruct` and
+   `@cf/meta/llama-4-scout-17b-16e-instruct` on Cloudflare Workers AI. The two
+   fallbacks are deliberately on a **different billing rail**: the old chain was
+   four Hugging Face models, which meant one exhausted credit balance returned 402
+   for every one of them at once. Cloudflare's free tier is 10,000 Neurons/day,
+   roughly 900 sentiment calls, so the leg survives a spent Hugging Face balance.
+   Models that emit their answer in `reasoning` and leave `content` empty are
+   unusable here and were excluded by measurement, not by reputation.
 4. **Risk** (Claude) — final gate; vetoes unsafe trades. Uses **Sonnet** via the
    Claude Agent SDK — drawing on your **Claude Pro plan's included usage** — for the
    crucial exit decisions, and the **Haiku** API for the high-volume buy screen;
@@ -48,7 +57,17 @@ absence of data must be stated, not hallucinated.
 | Trailing-stop activation (gain before it arms) | 3% | `TRAIL_ACTIVATE_PCT` |
 | Position size | 2% of equity | `POSITION_SIZE_PCT` |
 | Max concurrent positions | 8 | `MAX_POSITIONS` |
+| Cash floor never spent | $500 | `CASH_RESERVE_USD` |
 | Tickers per batch | 10 | `TICKER_BATCH_SIZE` |
+
+Position sizing is a percentage of *portfolio value*, which says nothing about
+settled cash. Until the **cash guard** was added, `MAX_POSITIONS x
+POSITION_SIZE_PCT <= 100%` was the only thing keeping the bot off margin — and a
+paper account is typically handed ~4x buying power, so an over-budget order fills
+silently on borrowed money rather than failing. `execute_trades()` now tracks
+spendable cash across the run, trims an order to what cash covers, and records
+`SKIPPED_CASH` once it is exhausted. Sell proceeds are not credited back mid-run,
+since they are unsettled until the fill lands.
 
 The **trailing stop** arms only after a position's running peak gains
 `TRAIL_ACTIVATE_PCT` above entry, then exits on a `TRAIL_STOP_PCT` pullback from
@@ -65,6 +84,11 @@ cp .env.example ~/.env        # fill in your keys
 
 Keys required in `~/.env`: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `GEMINI_API_KEY`,
 `ANTHROPIC_API_KEY`, `HF_API_TOKEN`. See `.env.example`.
+
+**Recommended — Cloudflare Workers AI fallback.** Set `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_API_TOKEN` (the token needs only **Account > Workers AI > Read**) to give
+the sentiment leg a free fallback on a separate billing rail. Without them the leg is
+Hugging Face only, and a spent credit balance takes the whole thing down at once.
 
 **Optional — Claude Sonnet via subscription.** To run the risk/exit gate on Claude
 **Sonnet** through the Claude Agent SDK — drawing on your **Claude Pro plan's
@@ -126,7 +150,7 @@ python3 dashboard/app.py
 ```
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
 llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
-healthcheck.py         # run-freshness check, notifies via ntfy
+healthcheck.py         # run-freshness + degraded-LLM check, notifies via ntfy
 requirements.txt
 dashboard/
   app.py               # Flask dashboard
