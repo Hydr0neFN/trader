@@ -46,6 +46,9 @@ MAX_AGE_MIN  = int(os.environ.get("HEALTHCHECK_MAX_AGE_MIN", "90"))
 # Re-alert on a still-degraded LLM chain at most this often, so a multi-day
 # outage is loud on day one without spamming every 30 min after that.
 DEGRADED_REALERT_H = int(os.environ.get("HEALTHCHECK_DEGRADED_REALERT_H", "12"))
+# Consecutive `clock_check_failed` runs (30 min apart) before alerting. One is a
+# blip trader.py already fails closed on; two means an hour of no trading.
+CLOCK_FAIL_ALERT_N = int(os.environ.get("HEALTHCHECK_CLOCK_FAIL_N", "2"))
 ET           = ZoneInfo("America/New_York")
 
 
@@ -80,6 +83,30 @@ def last_run_log_ts() -> datetime | None:
         return datetime.fromisoformat(ts) if ts else None
     except (ValueError, json.JSONDecodeError):
         return None
+
+
+def trailing_clock_failures() -> int:
+    """How many of the newest run_log lines in a row are `clock_check_failed`.
+
+    Such a run still writes a line, so the freshness check above passes; this
+    is the only thing that notices an Alpaca outage during market hours.
+    """
+    if not RUN_LOG.exists():
+        return 0
+    try:
+        lines = [l for l in RUN_LOG.read_text().splitlines() if l.strip()]
+    except OSError:
+        return 0
+    n = 0
+    for line in reversed(lines):
+        try:
+            event = json.loads(line).get("event")
+        except json.JSONDecodeError:
+            break
+        if event != "clock_check_failed":
+            break
+        n += 1
+    return n
 
 
 def last_run_complete() -> dict | None:
@@ -200,6 +227,14 @@ def main() -> int:
     if age_min > MAX_AGE_MIN:
         notify(f"trader stale: last run_log line {age_min:.0f} min ago "
                f"(>{MAX_AGE_MIN}) — cron/import likely broken")
+        return 1
+
+    # Fresh, but only because trader.py keeps logging that it could not reach
+    # the Alpaca clock -- it fails closed, so nothing is trading.
+    clock_fails = trailing_clock_failures()
+    if clock_fails >= CLOCK_FAIL_ALERT_N:
+        notify(f"Alpaca clock check failed {clock_fails} runs in a row during "
+               f"market hours -- trader is not trading")
         return 1
 
     # Fresh, but the run may still have flown blind: a total sentiment-chain

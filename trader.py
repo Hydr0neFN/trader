@@ -117,6 +117,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+# `--verbose` turns on this module's DEBUG lines (raw LLM replies, prompt
+# previews). Only this logger: root stays at INFO so library chatter does not
+# flood cron.log. Without it log.debug was dead code, and the one diagnostic
+# that mattered was logged at INFO every run instead.
+if "--verbose" in sys.argv[1:]:
+    log.setLevel(logging.DEBUG)
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -190,6 +196,23 @@ def save_peaks(peaks: dict) -> None:
     PEAKS_FILE.write_text(json.dumps(peaks, indent=2))
 
 
+def reset_peak(ticker: str) -> None:
+    """Forget a ticker's trailing-stop high-water mark.
+
+    Called on every full exit and every new entry. check_hard_stops() only
+    prunes with the positions it saw at Step 0a, so an AI exit (0b) followed
+    by a same-run re-buy (Step 4) used to inherit the OLD position's peak and
+    trail against it -- a premature trailing stop on the fresh entry.
+    """
+    try:
+        peaks = load_peaks()
+        if ticker in peaks:
+            peaks.pop(ticker)
+            save_peaks(peaks)
+    except OSError as exc:
+        log.warning("Could not reset trailing peak for %s: %s", ticker, exc)
+
+
 def trading_days_between(start: datetime, end: datetime) -> int:
     """Count Mon–Fri days between two datetimes (does not adjust for holidays)."""
     days = 0
@@ -246,23 +269,30 @@ def find_original_buy_reasoning(ticker: str) -> str:
 
 # ── Market hours check ────────────────────────────────────────────────────────
 
-def is_market_open(client: TradingClient) -> bool:
-    """Check local time window first (fast), then confirm via Alpaca clock (handles holidays)."""
+def market_status(client: TradingClient) -> str:
+    """"open", "closed" or "clock_error".
+
+    Local time window first (fast), then the Alpaca clock (holidays, early
+    closes). A clock failure fails CLOSED -- the clock is the only holiday gate,
+    so a transient error must not let the run trade on stale data -- but it is
+    reported as its own state: logged as `market_closed`, a sustained Alpaca
+    outage during market hours kept run_log fresh and looked healthy.
+    """
     n = now_et()
     if n.weekday() >= 5:
-        return False
+        return "closed"
     if not (dtime(9, 30) <= n.time() < dtime(16, 0)):
-        return False
+        return "closed"
     try:
         clock = retry(lambda: client.get_clock(), retries=1, delay=2.0)
-        return clock.is_open
+        return "open" if clock.is_open else "closed"
     except Exception as exc:
-        # Fail CLOSED: the Alpaca clock is the only holiday/early-close gate, so
-        # a transient error must not let the run trade on a holiday with stale
-        # data. Skipping one 30-min cycle is cheap; if Alpaca is truly down,
-        # order submission would fail anyway.
         log.warning("Alpaca clock check failed (%s); skipping this cycle to be safe.", exc)
-        return False
+        return "clock_error"
+
+
+def is_market_open(client: TradingClient) -> bool:
+    return market_status(client) == "open"
 
 
 # ── Step 1: Data Ingestion ────────────────────────────────────────────────────
@@ -363,13 +393,44 @@ GEMINI_MODEL_PRIORITY = [
 ]
 
 
+def _gemini_chain_call(contents: str, system_instruction: str, parse, pfx: str,
+                       what: str) -> tuple:
+    """Walk GEMINI_MODEL_PRIORITY until one model answers and `parse` accepts it.
+
+    Returns (parse(raw_text), model). A parse failure counts as a model failure
+    and moves on, as before. Raises RuntimeError once every model is exhausted.
+    Shared by run_analyst() and run_exit_analyst(), which carried two copies.
+    """
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    last_exc = None
+    for model in GEMINI_MODEL_PRIORITY:
+        try:
+            def call(m=model):
+                response = client.models.generate_content(
+                    model=m,
+                    contents=contents,
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                    ),
+                )
+                return response.text
+
+            # 1 retry per model so we move on quickly if it is flaky
+            raw = retry(call, retries=1, delay=4.0)
+            return parse(raw), model
+        except Exception as exc:
+            log.warning("%s%s model %s failed (%s) -- trying next...",
+                        pfx, what, model, str(exc)[:70])
+            last_exc = exc
+    raise RuntimeError(f"{pfx}All Gemini models exhausted. Last error: {last_exc}")
+
+
 def run_analyst(data_blocks: list, batch_label: str = "") -> tuple:
     """Call Gemini on a batch of data_blocks.
 
     Returns (recs_list, model_used).  batch_label is logged for traceability.
     """
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    last_exc = None
     pfx = f"[{batch_label}] " if batch_label else ""
 
     # ── Optional agy path (subscription quota) — falls back to the API chain ──
@@ -385,34 +446,14 @@ def run_analyst(data_blocks: list, batch_label: str = "") -> tuple:
             log.warning("%sagy analyst failed (%s) — falling back to Gemini API…",
                         pfx, str(exc)[:120])
 
-    for model in GEMINI_MODEL_PRIORITY:
-        try:
-            def call(m=model):
-                response = client.models.generate_content(
-                    model=m,
-                    contents="\n\n".join(data_blocks),
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=ANALYST_SYSTEM,
-                        response_mime_type="application/json",
-                    ),
-                )
-                return response.text
+    def parse(raw):
+        recs = json.loads(strip_json_fences(raw))
+        return [recs] if isinstance(recs, dict) else recs
 
-            # 1 retry per model so we move on quickly if it is flaky
-            raw = retry(call, retries=1, delay=4.0)
-            text = strip_json_fences(raw)
-            recs = json.loads(text)
-            if isinstance(recs, dict):
-                recs = [recs]
-            log.info("%sAnalyst using model: %s (%d recs)", pfx, model, len(recs))
-            return recs, model
-
-        except Exception as exc:
-            log.warning("%sModel %s unavailable (%s) -- trying next...", pfx, model, str(exc)[:70])
-            last_exc = exc
-            continue
-
-    raise RuntimeError(f"{pfx}All Gemini models exhausted. Last error: {last_exc}")
+    recs, model = _gemini_chain_call("\n\n".join(data_blocks), ANALYST_SYSTEM,
+                                     parse, pfx, "Analyst")
+    log.info("%sAnalyst using model: %s (%d recs)", pfx, model, len(recs))
+    return recs, model
 
 
 # ── Step 2.5: Sentiment Analyst — Hugging Face ───────────────────────────────
@@ -712,10 +753,21 @@ def _claude_via_sdk(system: str, user: str, call_type: str = "exit", label: str 
     return text
 
 
+_ANTHROPIC_CLIENT = None
+
+
+def _anthropic_client() -> Anthropic:
+    """One pooled client per process, like _HF_CLIENT / _CF_CLIENT."""
+    global _ANTHROPIC_CLIENT
+    if _ANTHROPIC_CLIENT is None:
+        _ANTHROPIC_CLIENT = Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _ANTHROPIC_CLIENT
+
+
 def _claude_via_api(system: str, user: str, max_tokens: int,
                      call_type: str = "exit", label: str = "") -> str:
     """Metered Anthropic API call on Haiku (fallback path)."""
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = _anthropic_client()
     start = time.time()
     try:
         msg = client.messages.create(
@@ -1020,42 +1072,25 @@ def run_exit_analyst(position_context: str, batch_label: str = "") -> dict:
                         pfx, str(exc)[:120])
 
     # ── Primary: Gemini API priority chain ──
-    client  = genai.Client(api_key=GEMINI_API_KEY)
-    last_exc = None
+    def parse(raw):
+        data = json.loads(strip_json_fences(raw))
+        action = data.get("action", "HOLD").upper()
+        if action not in ("HOLD", "TRIM", "EXIT"):
+            action = "HOLD"
+        return {
+            "action":     action,
+            "confidence": int(data.get("confidence", 0)),
+            "reasoning":  data.get("reasoning", ""),
+        }
 
-    for model in GEMINI_MODEL_PRIORITY:
-        try:
-            def call(m=model):
-                response = client.models.generate_content(
-                    model=m,
-                    contents=position_context,
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=EXIT_ANALYST_SYSTEM,
-                        response_mime_type="application/json",
-                    ),
-                )
-                return response.text
-
-            raw  = retry(call, retries=1, delay=4.0)
-            data = json.loads(strip_json_fences(raw))
-            action = data.get("action", "HOLD").upper()
-            if action not in ("HOLD", "TRIM", "EXIT"):
-                action = "HOLD"
-            log.info("%sExit analyst using model: %s", pfx, model)
-            return {
-                "action":     action,
-                "confidence": int(data.get("confidence", 0)),
-                "reasoning":  data.get("reasoning", ""),
-                "model":      model,
-            }
-
-        except Exception as exc:
-            log.warning("%sExit analyst model %s failed (%s) -- trying next…", pfx, model, str(exc)[:70])
-            last_exc = exc
-            continue
-
-    log.error("%sAll Gemini models failed for exit analysis: %s", pfx, last_exc)
-    return {"action": "HOLD", "confidence": 0, "reasoning": f"Gemini error: {last_exc}", "model": "none"}
+    try:
+        rec, model = _gemini_chain_call(position_context, EXIT_ANALYST_SYSTEM,
+                                        parse, pfx, "Exit analyst")
+    except RuntimeError as exc:
+        log.error("%sAll Gemini models failed for exit analysis: %s", pfx, exc)
+        return {"action": "HOLD", "confidence": 0, "reasoning": f"Gemini error: {exc}", "model": "none"}
+    log.info("%sExit analyst using model: %s", pfx, model)
+    return {**rec, "model": model}
 
 
 def run_exit_risk_manager(position_context: str, exit_rec: dict) -> tuple:
@@ -1132,13 +1167,25 @@ def open_order_symbols(client: TradingClient) -> set:
         return set()
 
 
-def pending_buy_exposure(client: TradingClient) -> tuple:
+def pending_buy_exposure(client: TradingClient, price_of=None,
+                         fallback_notional: float = 0.0,
+                         held_symbols=frozenset()) -> tuple:
     """(count, notional) of still-unfilled BUY orders.
 
     Alpaca does not debit `cash` when an order is submitted, only when it
     fills, and an unfilled BUY is not yet a position either -- so a DAY order
     left open at the close is invisible to both the cash guard and the slot
     count on the next run. Both would then be spent twice.
+
+    Every BUY is a MarketOrderRequest: no limit_price, and an open order has no
+    filled_avg_price, so pricing it from those two fields always gave $0 and
+    the cash guard never saw the pending order. Price the UNFILLED qty from,
+    in order: the order's own `notional`, its limit price, `price_of(symbol)`
+    (the caller's latest quote), and finally `fallback_notional` -- the
+    per-position budget every BUY is sized under, a safe upper bound, scaled
+    to the unfilled fraction. `count` excludes symbols already in
+    `held_symbols`: a partially filled BUY is a position already and must not
+    take a second MAX_POSITIONS slot.
     """
     try:
         orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
@@ -1148,12 +1195,28 @@ def pending_buy_exposure(client: TradingClient) -> tuple:
     count = 0
     notional = 0.0
     for o in orders:
-        if str(getattr(o, "side", "")).lower().endswith("buy"):
+        if not str(getattr(o, "side", "")).lower().endswith("buy"):
+            continue
+        if o.symbol not in held_symbols:
             count += 1
-            qty = float(getattr(o, "qty", 0) or 0)
-            ref = getattr(o, "limit_price", None) or getattr(o, "filled_avg_price", None)
-            if ref:
-                notional += qty * float(ref)
+        order_notional = getattr(o, "notional", None)
+        if order_notional:
+            notional += float(order_notional) - float(getattr(o, "filled_qty", 0) or 0) \
+                * float(getattr(o, "filled_avg_price", 0) or 0)
+            continue
+        total_qty = float(getattr(o, "qty", 0) or 0)
+        qty = total_qty - float(getattr(o, "filled_qty", 0) or 0)
+        ref = getattr(o, "limit_price", None)
+        if not ref and price_of is not None:
+            try:
+                ref = price_of(o.symbol)
+            except Exception:
+                ref = None
+        if ref:
+            notional += max(0.0, qty) * float(ref)
+        else:
+            frac = (qty / total_qty) if total_qty > 0 else 1.0
+            notional += fallback_notional * min(1.0, max(0.0, frac))
     return count, notional
 
 
@@ -1187,7 +1250,12 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
 
     # An unfilled BUY from an earlier run is neither a position nor a cash
     # debit yet, so charge it against both budgets before spending them again.
-    pending_buys, pending_notional = pending_buy_exposure(client)
+    pending_buys, pending_notional = pending_buy_exposure(
+        client,
+        price_of=lambda sym: (data_map.get(sym) or {}).get("current_price"),
+        fallback_notional=max_trade_val,
+        held_symbols=set(positions),
+    )
     if pending_buys:
         open_count     += pending_buys
         cash_remaining -= pending_notional
@@ -1251,6 +1319,7 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                 open_count += 1
                 cash_remaining -= qty * price
                 bought.add(ticker)
+                reset_peak(ticker)   # a fresh entry starts a fresh high-water mark
                 fees = calc_sim_fees("BUY", qty, price)
                 jsonl_append(LOG_DIR / "executed.jsonl", {
                     "timestamp":  ts,
@@ -1294,6 +1363,7 @@ def execute_trades(approved: list, data_map: dict, client: TradingClient) -> dic
                 # restores buying power on fill rather than on settlement.
                 # Without this a full book can sell but never rotate.
                 cash_remaining += held_qty * price
+                reset_peak(ticker)
                 fees = calc_sim_fees("SELL", held_qty, price)
                 jsonl_append(LOG_DIR / "executed.jsonl", {
                     "timestamp":  ts,
@@ -1649,6 +1719,8 @@ def run_ai_exits(
                      exit_type_label, sell_qty, ticker, current,
                      fees["sim_total_fee"], order.id)
             sold_tickers.append(ticker)
+            if exit_action != "TRIM":
+                reset_peak(ticker)
             final_action = "TRIMMED" if exit_action == "TRIM" else "EXITED"
         except Exception as exc:
             log.error("  AI exit order failed for %s: %s", ticker, exc)
@@ -1677,11 +1749,14 @@ def main() -> None:
 
     alpaca = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
-    if not is_market_open(alpaca):
-        log.info("Market closed at %s — exiting.", now_et().isoformat())
+    status = market_status(alpaca)
+    if status != "open":
+        # healthcheck.py alerts on repeated clock_check_failed in market hours.
+        event = "clock_check_failed" if status == "clock_error" else "market_closed"
+        log.info("%s at %s — exiting.", event, now_et().isoformat())
         jsonl_append(LOG_DIR / "run_log.jsonl", {
             "timestamp": now_et().isoformat(),
-            "event":     "market_closed",
+            "event":     event,
         })
         sys.exit(0)
 
@@ -1963,7 +2038,7 @@ def main() -> None:
             f"MARKET DATA:\n{haiku_input}\n\n"
             f"ANALYST RECOMMENDATION:\n{json.dumps(rec)}"
         )
-        log.info("DEBUG Haiku prompt for %s: %s", ticker, haiku_preview[:200])
+        log.debug("Haiku prompt for %s: %s", ticker, haiku_preview[:200])
         verdict, justification = run_risk_manager(haiku_input, rec, hf)
         api_calls["haiku"] += 1
         log.info("  %-6s Gemini=%s(%s%%) Haiku=%s",
