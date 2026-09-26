@@ -4,6 +4,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -50,13 +51,19 @@ def get_alpaca() -> TradingClient:
 
 
 def cached(key: str, ttl: float, fn):
-    """Return fn() memoized for `ttl` seconds (per-process)."""
+    """Return fn() memoized for `ttl` seconds (per-process).
+
+    Entries store their own expiry and every write sweeps the expired ones, so
+    keys that are never read again (e.g. a sparkline key for an old portfolio
+    composition) do not accumulate for the life of the worker."""
     hit = _cache.get(key)
     now = time.monotonic()
-    if hit and now - hit[0] < ttl:
+    if hit and now < hit[0]:
         return hit[1]
     val = fn()
-    _cache[key] = (now, val)
+    for k in [k for k, (exp, _) in _cache.items() if exp <= now]:
+        del _cache[k]
+    _cache[key] = (now + ttl, val)
     return val
 
 
@@ -245,14 +252,25 @@ def inject_i18n():
     return ctx
 
 
+def _local_path(nxt: str) -> str:
+    """`nxt` if it is a same-site path, else "/". Browsers treat a backslash as a
+    slash and drop tabs/newlines, so a backslash or control character after the
+    leading slash can still land on `//evil.com`: reject those, and anything that
+    parses with a scheme or host."""
+    if (not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt
+            or any(ord(c) < 0x20 or ord(c) == 0x7F for c in nxt)):
+        return "/"
+    parts = urlsplit(nxt)
+    if parts.scheme or parts.netloc:
+        return "/"
+    return nxt
+
+
 @app.route("/lang/<code>")
 def set_lang(code):
     """Persist a language choice and return where the user came from."""
     lang = i18n.normalize(code) or i18n.DEFAULT_LANG
-    nxt = request.args.get("next", "/")
-    # Only ever redirect within this site.
-    if not nxt.startswith("/") or nxt.startswith("//"):
-        nxt = "/"
+    nxt = _local_path(request.args.get("next", "/"))
     resp = make_response(redirect(nxt, code=302))
     resp.set_cookie(i18n.COOKIE, lang, max_age=60 * 60 * 24 * 365,
                     samesite="Lax", path="/")
