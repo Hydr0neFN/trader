@@ -589,7 +589,7 @@ def run_sentiment_analyst(data_block: str) -> dict:
 CLAUDE_SDK_ENABLED = os.environ.get("CLAUDE_SDK_ENABLED", "1").lower() in ("1", "true", "yes")
 CLAUDE_OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
 CLAUDE_SDK_MODEL   = os.environ.get("CLAUDE_SDK_MODEL", "sonnet")
-CLAUDE_API_MODEL   = os.environ.get("CLAUDE_API_MODEL", "claude-haiku-4-5-20251001")
+CLAUDE_API_MODEL   = os.environ.get("CLAUDE_API_MODEL", "claude-haiku-5-5")
 CLAUDE_CLI_PATH    = os.environ.get("CLAUDE_CLI_PATH", "claude")
 CLAUDE_SDK_TIMEOUT = int(os.environ.get("CLAUDE_SDK_TIMEOUT", "120"))
 # Prepended to every SDK system prompt. The `claude` CLI is an agentic harness,
@@ -627,6 +627,15 @@ EXIT_GATE = os.environ.get("EXIT_GATE", "0") == "1"
 # uses); "cache_read" is a hit against that cache. Rates change over time —
 # update this dict, and only this dict, when Anthropic republishes pricing.
 CLAUDE_PRICES = {
+    # Haiku 5.5, prompts up to 100k tokens (over 100k: $0.50 in / $2.50 out —
+    # never reached here, buy/exit prompts are a few k tokens). Verified
+    # against platform.claude.com/docs pricing on 2026-10-08.
+    "claude-haiku-5-5": {
+        "input":          0.10,   # $/MTok, base (uncached) input
+        "output":         0.50,   # $/MTok
+        "cache_write_5m": 0.125,  # $/MTok, 5-minute ephemeral cache write
+        "cache_read":     0.01,   # $/MTok, cache hit
+    },
     "claude-haiku-4-5-20251001": {
         "input":          1.00,   # $/MTok, base (uncached) input
         "output":         5.00,   # $/MTok
