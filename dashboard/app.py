@@ -163,7 +163,7 @@ def active_models() -> list:
 
     def _from_llm_calls():
         seen = []
-        for r in tail_jsonl("llm_calls.jsonl", 200):
+        for r in reversed(tail_jsonl("llm_calls.jsonl", 200)):  # newest first
             m = r.get("model")
             if m and m not in seen:
                 seen.append(m)
@@ -171,7 +171,7 @@ def active_models() -> list:
 
     def _from_decisions():
         seen = []
-        for r in tail_jsonl("decisions.jsonl", 120):
+        for r in reversed(tail_jsonl("decisions.jsonl", 120)):  # newest first
             for key in ("gemini_model", "hf_model"):
                 m = r.get(key)
                 if m and m not in ("none", "N/A") and m not in seen:
