@@ -782,6 +782,9 @@ def _claude_via_api(system: str, user: str, max_tokens: int,
         msg = client.messages.create(
             model=CLAUDE_API_MODEL,
             max_tokens=max_tokens,
+            # Haiku 5.5 thinks by default; the thinking block eats max_tokens and
+            # leaves no text block, so every gate would parse-fail into a VETO.
+            thinking={"type": "disabled"},
             system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user}],
         )
@@ -796,16 +799,17 @@ def _claude_via_api(system: str, user: str, max_tokens: int,
     usage = msg.usage
     cache_creation = getattr(usage, "cache_creation_input_tokens", None)
     cache_read     = getattr(usage, "cache_read_input_tokens", None)
-    cost = _claude_cost_usd(CLAUDE_API_MODEL, usage.input_tokens, usage.output_tokens,
+    served = getattr(msg, "model", None) or CLAUDE_API_MODEL   # bill/log what answered
+    cost = _claude_cost_usd(served, usage.input_tokens, usage.output_tokens,
                              cache_creation, cache_read)
     _log_llm_call(
-        model=CLAUDE_API_MODEL, path="haiku-api", call_type=call_type, label=label,
+        model=served, path="haiku-api", call_type=call_type, label=label,
         latency_ms=(time.time() - start) * 1000,
         input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
         cache_creation_input_tokens=cache_creation, cache_read_input_tokens=cache_read,
         cost_usd=cost, billing="metered",
     )
-    return msg.content[0].text.strip()
+    return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
 
 
 def claude_complete(system: str, user: str, max_tokens: int, label: str = "",
