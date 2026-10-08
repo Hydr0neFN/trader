@@ -781,7 +781,9 @@ def _claude_via_api(system: str, user: str, max_tokens: int,
     try:
         msg = client.messages.create(
             model=CLAUDE_API_MODEL,
-            max_tokens=max_tokens,
+            # Haiku 5.5 writes prose reasoning before the JSON; at the callers' 150
+            # tokens it was cut off mid-prose and every gate parse-failed to VETO.
+            max_tokens=max(max_tokens, 700),
             # Haiku 5.5 thinks by default; the thinking block eats max_tokens and
             # leaves no text block, so every gate would parse-fail into a VETO.
             thinking={"type": "disabled"},
