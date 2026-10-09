@@ -433,6 +433,28 @@ def run_analyst(data_blocks: list, batch_label: str = "") -> tuple:
     """
     pfx = f"[{batch_label}] " if batch_label else ""
 
+    # ── Optional DeepSeek path (local deeperseeker proxy) — falls back to agy/API ──
+    if USE_DEEPSEEK and not _ds_state["off"]:
+        try:
+            raw  = call_deepseek(ANALYST_SYSTEM, "\n\n".join(data_blocks))
+            recs = json.loads(strip_json_fences(raw))
+            if isinstance(recs, dict):
+                recs = [recs]
+            # Valid JSON in the wrong shape (a wrapper object, a scalar, rows
+            # without a ticker) would log the whole batch as UNKNOWN instead of
+            # falling back -- treat it as a DeepSeek failure.
+            if not (isinstance(recs, list) and recs
+                    and all(isinstance(r, dict) and isinstance(r.get("ticker"), str)
+                            and r["ticker"].strip() for r in recs)):
+                raise ValueError(f"unexpected analyst shape: {str(recs)[:80]}")
+            _ds_record(True)
+            log.info("%sAnalyst using deepseek: %s (%d recs)", pfx, DEEPSEEK_MODEL, len(recs))
+            return recs, f"ds:{DEEPSEEK_MODEL}"
+        except Exception as exc:
+            _ds_record(False)
+            log.warning("%sdeepseek analyst failed (%s) — falling back…",
+                        pfx, str(exc)[:120])
+
     # ── Optional agy path (subscription quota) — falls back to the API chain ──
     if USE_AGY_GEMINI:
         try:
@@ -965,6 +987,27 @@ AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.8 Flash (High)")
 AGY_TIMEOUT    = int(os.environ.get("AGY_TIMEOUT", "120"))
 USE_AGY_GEMINI = os.environ.get("USE_AGY_GEMINI", "0").lower() in ("1", "true", "yes")
 
+# DeepSeek via "deeperseeker": a local reverse proxy (same host, OpenAI-compatible
+# /v1/chat/completions) that fronts a throwaway DeepSeek *web-chat* account. That
+# breaks DeepSeek's ToS, so expect the account to be banned and the token to expire
+# at any time; both surface as HTTP errors (401/429/5xx). The proxy also falls over
+# under concurrency (3 parallel requests -> 502), so calls MUST stay sequential --
+# never thread them. During DeepSeek incidents one upstream attempt hangs ~60s
+# (generation_timeout). The proxy's own retries are switched off on the Pi
+# (DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS=1) so it gives up before DEEPSEEK_TIMEOUT, and a
+# timed-out request never keeps running behind the next one. The per-run circuit
+# breaker below caps an incident's cost at a few such waits. When USE_DEEPSEEK=1 the
+# analyst and exit analyst try DeepSeek first, then agy, then the Gemini API chain.
+DEEPSEEK_BASE    = os.environ.get("DEEPSEEK_BASE", "http://127.0.0.1:4000/v1")
+DEEPSEEK_MODEL   = os.environ.get("DEEPSEEK_MODEL", "v4.1flash")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_TIMEOUT = int(os.environ.get("DEEPSEEK_TIMEOUT", "75"))
+USE_DEEPSEEK     = os.environ.get("USE_DEEPSEEK", "0").lower() in ("1", "true", "yes")
+# In-process circuit breaker: after N consecutive DeepSeek failures in a single run,
+# stop calling it for the rest of the run (avoids N x ~120s hangs and overlapping crons).
+_ds_state = {"fails": 0, "off": False}
+_DS_MAX_FAILS = 3
+
 
 def call_gemini_cli(system_prompt: str, user_prompt: str, model):
     """Call the local gemini CLI in headless mode.
@@ -1035,6 +1078,52 @@ def call_agy(system_prompt: str, user_prompt: str) -> str:
     return out
 
 
+def call_deepseek(system_prompt: str, user_prompt: str) -> str:
+    """Send a prompt to DeepSeek through the local deeperseeker proxy.
+
+    OpenAI-compatible chat completion; system and user go as separate roles.
+    Calls must stay sequential (the proxy returns 502 under concurrency).
+
+    Returns:
+        str: message content (expected JSON per the system prompt).
+    Raises:
+        RuntimeError: on missing key, non-200 status, or empty content.
+    """
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY not set")
+    resp = requests.post(
+        f"{DEEPSEEK_BASE.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+        json={
+            "model":       DEEPSEEK_MODEL,
+            "messages":    [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature": 0,
+        },
+        timeout=DEEPSEEK_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"deepseek HTTP {resp.status_code}: {resp.text[:160]}")
+    out = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+    if not out:
+        raise RuntimeError("deepseek empty response")
+    return out
+
+
+def _ds_record(ok: bool) -> None:
+    """Update the DeepSeek circuit breaker after an attempt (call + parse)."""
+    if ok:
+        _ds_state["fails"] = 0
+        return
+    _ds_state["fails"] += 1
+    if _ds_state["fails"] >= _DS_MAX_FAILS and not _ds_state["off"]:
+        _ds_state["off"] = True
+        log.warning("DeepSeek disabled for the rest of this run after %d failures",
+                    _DS_MAX_FAILS)
+
+
 def run_exit_analyst(position_context: str, batch_label: str = "") -> dict:
     """Call Gemini to decide HOLD / TRIM / EXIT for one position.
 
@@ -1046,6 +1135,28 @@ def run_exit_analyst(position_context: str, batch_label: str = "") -> dict:
     Returns dict with action, confidence, reasoning, model.
     """
     pfx = f"[{batch_label}] " if batch_label else ""
+
+    # ── Optional DeepSeek path (local deeperseeker proxy) — falls back to agy/CLI/API ──
+    if USE_DEEPSEEK and not _ds_state["off"]:
+        try:
+            raw    = call_deepseek(EXIT_ANALYST_SYSTEM, position_context)
+            data   = json.loads(strip_json_fences(raw))
+            action = data.get("action", "HOLD").upper()
+            if action not in ("HOLD", "TRIM", "EXIT"):
+                action = "HOLD"
+            result = {
+                "action":     action,
+                "confidence": safe_int(data.get("confidence", 0)),
+                "reasoning":  data.get("reasoning", ""),
+                "model":      f"ds:{DEEPSEEK_MODEL}",
+            }
+            _ds_record(True)
+            log.info("%sExit analyst using deepseek: %s", pfx, DEEPSEEK_MODEL)
+            return result
+        except Exception as exc:
+            _ds_record(False)
+            log.warning("%sdeepseek exit analyst failed (%s) — falling back…",
+                        pfx, str(exc)[:120])
 
     # ── Optional agy path (subscription quota) — falls back to CLI/API below ──
     if USE_AGY_GEMINI:
@@ -1843,6 +1954,7 @@ def main() -> None:
 
     analyst_recs: list = []
     gemini_model_used = "unknown"
+    ticker_model: dict = {}    # ticker -> model that answered its batch
 
     for batch_start in range(0, len(ordered_blocks), TICKER_BATCH_SIZE):
         batch_items  = ordered_blocks[batch_start: batch_start + TICKER_BATCH_SIZE]
@@ -1863,11 +1975,17 @@ def main() -> None:
             batch_recs, model = run_analyst(batch_blocks, batch_label)
             analyst_recs.extend(batch_recs)
             gemini_model_used = model       # last-used model (usually consistent)
+            # Per-ticker label: with the DeepSeek -> agy -> Gemini fallback, batches
+            # in one run can be answered by different providers, and the decision
+            # log is how provider eras get separated later.
+            for t in batch_tickers:
+                ticker_model[t] = model
             api_calls["gemini"] += 1
         except Exception as exc:
             log.error("  Gemini failed for %s: %s — skipping batch", batch_label, exc)
             # Inject HOLD fallbacks so tickers aren't silently missing from decisions
             for t in batch_tickers:
+                ticker_model[t] = "none"
                 analyst_recs.append({
                     "ticker":         t,
                     "recommendation": "HOLD",
@@ -2163,7 +2281,7 @@ def main() -> None:
             "ma20":                  mdata.get("ma20"),
             "ma50":                  mdata.get("ma50"),
             "volume":                mdata.get("volume"),
-            "gemini_model":          gemini_model_used,
+            "gemini_model":          ticker_model.get(ticker, gemini_model_used),
             "gemini_recommendation": rec.get("recommendation", "UNKNOWN"),
             "gemini_confidence":     rec.get("confidence"),
             "gemini_reasoning":      rec.get("reasoning", ""),
