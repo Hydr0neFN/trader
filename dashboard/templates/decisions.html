@@ -89,12 +89,13 @@
         </div>
         <div class="d-flex gap-2 flex-wrap">
           {% set ea = d.gemini_exit_action | upper if d.gemini_exit_action else 'N/A' %}
+          {% set prov = d.gemini_exit_model | llm_provider %}
           {% if ea == 'EXIT' %}
-            <span class="badge badge-sell">Gemini: EXIT</span>
+            <span class="badge badge-sell">{{ prov }}: EXIT</span>
           {% elif ea == 'TRIM' %}
-            <span class="badge badge-trim">Gemini: TRIM</span>
+            <span class="badge badge-trim">{{ prov }}: TRIM</span>
           {% else %}
-            <span class="badge badge-hold">Gemini: HOLD</span>
+            <span class="badge badge-hold">{{ prov }}: HOLD</span>
           {% endif %}
           {% if d.haiku_exit_verdict == 'APPROVED' %}
             <span class="badge badge-approved">Haiku: ✓</span>
@@ -182,12 +183,13 @@
           </span>
           {% endif %}
           {% set rec = d.gemini_recommendation | upper %}
+          {% set prov = d.gemini_model | llm_provider %}
           {% if rec == 'BUY' %}
-            <span class="badge badge-buy">Gemini: BUY</span>
+            <span class="badge badge-buy">{{ prov }}: BUY</span>
           {% elif rec == 'SELL' %}
-            <span class="badge badge-sell">Gemini: SELL</span>
+            <span class="badge badge-sell">{{ prov }}: SELL</span>
           {% else %}
-            <span class="badge badge-hold">Gemini: HOLD</span>
+            <span class="badge badge-hold">{{ prov }}: HOLD</span>
           {% endif %}
           {% set hfs = d.hf_sentiment | upper if d.hf_sentiment else 'N/A' %}
           {% if hfs == 'BULLISH' %}
@@ -243,9 +245,9 @@
             <span class="text-white">${{ "%.2f" | format(d.ma50) if d.ma50 else '—' }}</span>
           </div>
         </div>
-        <!-- Gemini reasoning -->
+        <!-- Analyst reasoning (provider named from the row's model label) -->
         <p class="section-label">
-          {{ L('lbl.gemini_reasoning') }}
+          {{ L('lbl.analyst_reasoning', p=d.gemini_model | llm_provider) }}
           {% if d.gemini_confidence is not none %}
           <span class="ms-2 text-white">{{ d.gemini_confidence }}% confidence</span>
           {% endif %}

@@ -451,7 +451,7 @@ def run_analyst(data_blocks: list, batch_label: str = "") -> tuple:
             log.info("%sAnalyst using deepseek: %s (%d recs)", pfx, DEEPSEEK_MODEL, len(recs))
             return recs, f"ds:{DEEPSEEK_MODEL}"
         except Exception as exc:
-            _ds_record(False)
+            _ds_record(False, str(exc)[:120])
             log.warning("%sdeepseek analyst failed (%s) — falling back…",
                         pfx, str(exc)[:120])
 
@@ -1005,7 +1005,8 @@ DEEPSEEK_TIMEOUT = int(os.environ.get("DEEPSEEK_TIMEOUT", "75"))
 USE_DEEPSEEK     = os.environ.get("USE_DEEPSEEK", "0").lower() in ("1", "true", "yes")
 # In-process circuit breaker: after N consecutive DeepSeek failures in a single run,
 # stop calling it for the rest of the run (avoids N x ~120s hangs and overlapping crons).
-_ds_state = {"fails": 0, "off": False}
+# ok / failed / last_error are per-run totals for run_complete (healthcheck.py alerts on them).
+_ds_state = {"fails": 0, "off": False, "ok": 0, "failed": 0, "last_error": ""}
 _DS_MAX_FAILS = 3
 
 
@@ -1112,12 +1113,15 @@ def call_deepseek(system_prompt: str, user_prompt: str) -> str:
     return out
 
 
-def _ds_record(ok: bool) -> None:
+def _ds_record(ok: bool, err: str = "") -> None:
     """Update the DeepSeek circuit breaker after an attempt (call + parse)."""
     if ok:
         _ds_state["fails"] = 0
+        _ds_state["ok"] += 1
         return
     _ds_state["fails"] += 1
+    _ds_state["failed"] += 1
+    _ds_state["last_error"] = err
     if _ds_state["fails"] >= _DS_MAX_FAILS and not _ds_state["off"]:
         _ds_state["off"] = True
         log.warning("DeepSeek disabled for the rest of this run after %d failures",
@@ -1154,7 +1158,7 @@ def run_exit_analyst(position_context: str, batch_label: str = "") -> dict:
             log.info("%sExit analyst using deepseek: %s", pfx, DEEPSEEK_MODEL)
             return result
         except Exception as exc:
-            _ds_record(False)
+            _ds_record(False, str(exc)[:120])
             log.warning("%sdeepseek exit analyst failed (%s) — falling back…",
                         pfx, str(exc)[:120])
 
@@ -2346,6 +2350,11 @@ def main() -> None:
         "cumulative_sim_fees": cumulative_sim_fees,
         "sentiment_failures":  SENTIMENT_STATE["failures"],
         "sentiment_calls":     SENTIMENT_STATE["calls"],
+        "deepseek_enabled":    USE_DEEPSEEK,
+        "deepseek_ok":         _ds_state["ok"],
+        "deepseek_failed":     _ds_state["failed"],
+        "deepseek_tripped":    _ds_state["off"],
+        "deepseek_last_error": _ds_state["last_error"],
     })
     log.info("=== Run complete ===")
 

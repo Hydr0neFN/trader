@@ -134,10 +134,14 @@ def _clean_model_id(raw) -> str:
     table is exactly what went stale in the footer before.
 
     agy:Gemini 3.8 Flash (High)   → Gemini 3.8 Flash
+    ds:v4.1flash                  → DeepSeek v4.1flash
     deepseek-ai/DeepSeek-V3.2-Exp → DeepSeek-V3.2-Exp
     claude-haiku-4-5-20251001     → claude-haiku-4-5
     """
     s = str(raw or "").strip()
+    # The proxy's ids ("v4.1flash") carry no vendor name, so keep it from the scheme.
+    if s.lower().startswith("ds:"):
+        s = "DeepSeek " + s[3:]
     s = re.sub(r"^[A-Za-z0-9_.-]+:", "", s)   # provider scheme, e.g. "agy:"
     s = s.split("/")[-1]                       # namespace, e.g. "deepseek-ai/"
     s = re.sub(r"\s*\([^)]*\)", "", s)          # mode suffix, e.g. " (High)"
@@ -277,7 +281,28 @@ def set_lang(code):
     return resp
 
 
+def llm_provider(model) -> str:
+    """Who answered, from the model label stored in the decision row.
+
+    The analyst and exit analyst try DeepSeek, then agy, then the Gemini API, and
+    the label records which one replied: `ds:v4.1flash`, `agy:Gemini 3.8 Flash
+    (High)`, `gemini-3.1-flash-lite`, or `none` for a failed batch. The JSON keys
+    stay `gemini_*` for log compatibility, so badges derive the name from the
+    label instead of hard-coding one. Anything else (empty, `none`, `gate`,
+    `unknown`) gets the generic "Analyst".
+
+    Keep in sync with `llmProvider()` in templates/history.html.
+    """
+    m = str(model or "").strip().lower()
+    if m.startswith("ds:"):
+        return "DeepSeek"
+    if m.startswith(("agy:", "cli:", "gemini")):
+        return "Gemini"
+    return "Analyst"
+
+
 # Register template filters
+app.jinja_env.filters["llm_provider"] = llm_provider
 app.jinja_env.filters["fmt_ts"]       = fmt_ts
 app.jinja_env.filters["fmt_currency"] = fmt_currency
 app.jinja_env.filters["fmt_pct"]      = fmt_pct

@@ -146,8 +146,10 @@ STRINGS = {
     "lbl.exit_reasoning":    ("Exit Reasoning", "出場理由"),
     "lbl.haiku_structural":  ("Haiku Structural", "Haiku 結構分析"),
     "lbl.haiku_justification":("Haiku Justification", "Haiku 審核理由"),
-    "lbl.gemini_reasoning":  ("Gemini Reasoning", "Gemini 分析推論"),
-    "lbl.gemini_execution":  ("Gemini Execution", "Gemini 執行策略"),
+    # {p} is the provider that answered (see llm_provider in app.py): DeepSeek,
+    # Gemini, or the generic "Analyst". Provider names stay in English.
+    "lbl.analyst_reasoning": ("{p} Reasoning", "{p} 推論"),
+    "lbl.analyst_execution": ("Analyst Execution", "分析模型執行策略"),
     "lbl.hf_sentiment":      ("Sentiment", "情緒指標"),
     "lbl.ds_risk_audit":     ("Risk Audit (advisory)", "風控審核（僅建議）"),
     "outcome.blocked":       ("BLOCKED", "遭阻擋"),
@@ -178,6 +180,7 @@ JS_KEYS = (
     "filter.count", "modal.trade_detail",
     "lbl.market_at_run", "lbl.ai_analysis", "lbl.risk_gate", "lbl.settlement",
     "lbl.reasoning", "lbl.veto_reasons", "lbl.confidence", "lbl.model",
+    "lbl.analyst_reasoning",
     "col.qty", "col.price", "col.time", "col.action", "col.ticker",
 )
 

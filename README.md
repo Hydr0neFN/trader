@@ -14,9 +14,14 @@ ensemble of language models, and places paper orders through Alpaca.
 Each run (every 30 min, 9:30–16:00 ET, weekdays) executes a pipeline per ticker batch:
 
 1. **Market data + news** — price history via yfinance, headlines via Alpaca news API.
-2. **Analyst** (Gemini) — BUY/SELL/HOLD recommendation with confidence + reasoning.
-   Walks a model-priority chain (`gemini-3.8-flash` → `gemini-3.6-flash` → … →
+2. **Analyst** (DeepSeek → agy → Gemini) — BUY/SELL/HOLD recommendation with
+   confidence + reasoning. With `USE_DEEPSEEK=1` it asks DeepSeek V4.1 Flash first,
+   through a local reverse proxy (see *DeepSeek via deeperseeker* below); then agy
+   (`USE_AGY_GEMINI=1`, a Gemini subscription); then the Gemini API, which walks a
+   model-priority chain (`gemini-3.8-flash` → `gemini-3.6-flash` → … →
    `gemini-3.1-flash-lite`) so it degrades gracefully when a model is quota-gated.
+   Each decision stores the model that answered it: `ds:v4.1flash`,
+   `agy:Gemini 3.8 Flash (High)`, `gemini-…`, or `none` for a failed batch.
 3. **Sentiment** (DeepSeek → Cloudflare Workers AI) — BULLISH/BEARISH/NEUTRAL
    second opinion. It only blocks a trade when it **directly contradicts** the
    analyst (BUY vs BEARISH, or SELL vs BULLISH); NEUTRAL (quiet/empty news) does
@@ -35,12 +40,13 @@ Each run (every 30 min, 9:30–16:00 ET, weekdays) executes a pipeline per ticke
    falls back to Haiku when no subscription token is configured.
 5. **Execution** — Alpaca paper order; a hard stop-loss floor **and a
    profit-protecting trailing stop** are enforced independently of the LLMs.
-6. **Exit analysis** — open positions are re-evaluated by a Gemini exit analyst and a
-   Claude exit-risk gate. With `USE_AGY_GEMINI=1` the exit analyst goes through the
-   Antigravity CLI against a Google AI **subscription** and falls back to the Gemini
-   API chain on any failure; otherwise it uses the API chain directly. (Google retired
-   the individual-tier `gemini-cli` on 2026-06-18; that path is off by default — set
-   `USE_GEMINI_EXIT_CLI=1` only with a paid-key-backed CLI.)
+6. **Exit analysis** — open positions are re-evaluated by an exit analyst and a
+   Claude exit-risk gate. The exit analyst uses the same order as step 2: DeepSeek
+   (`USE_DEEPSEEK=1`), then the Antigravity CLI against a Google AI **subscription**
+   (`USE_AGY_GEMINI=1`), then the Gemini API chain; each leg falls through to the next
+   on any failure, and with neither flag set it uses the API chain directly. (Google
+   retired the individual-tier `gemini-cli` on 2026-06-18; that path is off by default
+   — set `USE_GEMINI_EXIT_CLI=1` only with a paid-key-backed CLI.)
 
    Note the asymmetry this creates: a `HOLD` returns before the Claude gate is
    consulted, so the gate can veto an unwarranted exit but cannot catch a missed one.
@@ -125,11 +131,28 @@ included usage** rather than metered Haiku API tokens — add `CLAUDE_CODE_OAUTH
 `none`) and `CLAUDE_SDK_MODEL` (default `sonnet`). With no token the bot runs
 Haiku-only, exactly as before.
 
+**Optional — DeepSeek via deeperseeker.** `USE_DEEPSEEK=1` makes DeepSeek V4.1 Flash
+the first leg for the analyst and the exit analyst. It is reached through
+*deeperseeker*, a local OpenAI-compatible reverse proxy (default
+`http://127.0.0.1:4000/v1`) that fronts a **throwaway DeepSeek web-chat account**.
+That use is against DeepSeek's ToS, so expect the account to be banned and its token
+to expire without notice; both show up as HTTP errors (401/403/429/5xx). The proxy
+falls over under concurrency, so DeepSeek calls are strictly **sequential**. A
+per-run **circuit breaker** stops calling DeepSeek for the rest of the run after 3
+consecutive failures, which caps an outage's cost at a few timeouts. Fallback order:
+DeepSeek → agy → Gemini API chain; when DeepSeek is down the bot loses only its
+primary leg. Tunables: `DEEPSEEK_BASE` (default `http://127.0.0.1:4000/v1`),
+`DEEPSEEK_MODEL` (default `v4.1flash`), `DEEPSEEK_API_KEY` (required whenever
+`USE_DEEPSEEK=1`), `DEEPSEEK_TIMEOUT` (default 75 s). This is separate from the
+sentiment leg's `deepseek-ai/DeepSeek-V4.1-Flash` on Hugging Face (step 3). The JSON
+fields keep their `gemini_*` names for log compatibility whichever model answered.
+
 **Optional — Gemini via Antigravity subscription.** `USE_AGY_GEMINI=1` routes the
 analyst and exit analyst through the `agy` CLI, drawing on a Google AI subscription
 instead of the Gemini API key. That quota meters compute and resets **weekly**, so
 exhausting it returns a multi-day lockout rather than a next-day reset; any agy
-failure falls back to the API chain automatically. Tunables: `AGY_MODEL` (default
+failure falls back to the API chain automatically. When DeepSeek is also enabled, agy
+is the second leg, tried only after DeepSeek fails. Tunables: `AGY_MODEL` (default
 `Gemini 3.8 Flash (High)`), `AGY_BIN`, `AGY_TIMEOUT`.
 
 **Optional — quota valve.** `EXIT_GATE=1` limits the LLM exit review to positions
@@ -172,14 +195,41 @@ whole sentiment chain fell through and every ticker was scored NEUTRAL/0. The
 second is rate-limited and deliberately leaves the stale marker and the exit
 code alone, because the bot is alive; it is just flying blind.
 
+A third, independent alert covers DeepSeek (only when the run reports it enabled).
+When the circuit breaker tripped in the last run, healthcheck sends a **DeepSeek
+down** message with the last error; when that error text contains `HTTP 401` or
+`HTTP 403` (trader.py formats errors as `deepseek HTTP 401: ...`) it adds a hint that
+the userToken probably expired or was banned and needs a re-auth. Other errors, such
+as a timeout or a `max_tokens` complaint, get no hint. It keeps its own marker,
+`trade_logs/DEEPSEEK_DOWN`, so it is rate-limited separately from the degraded alert
+(same 12 h window).
+
+The marker is written only once an alert was actually delivered (or no channel is
+configured), so a failed ntfy/webhook POST is retried on the next run instead of going
+silent for 12 h; the `healthcheck.log` line is written either way. This holds for the
+degraded alert too. When DeepSeek answers again, healthcheck sends one **DeepSeek
+recovered** message, but only after a clean run (at least one successful call and no
+failed ones, breaker not tripped). The marker is not deleted: it is rewritten as
+`<original alert timestamp> RECOVERED`. The original timestamp keeps rate-limiting the
+down alert and the `RECOVERED` tag keeps the recovered message to once per outage, so
+a flapping DeepSeek (down, up, down, ...) alerts at most once per 12 h and sends at
+most one recovered message for that outage. A later alert, once the window has passed,
+replaces the marker and arms the next recovered message. A run that never called
+DeepSeek, or that still saw failures, leaves the marker alone. Like the degraded
+alert, it does not touch the stale marker or the exit code, because the bot has
+already fallen back to agy/Gemini and kept trading.
+
 ```cron
 */30 9-15 * * 1-5 HEALTHCHECK_NTFY_TOPIC=your-topic /usr/bin/python3 /path/to/healthcheck.py
 ```
 
 Tunables: `HEALTHCHECK_MAX_AGE_MIN` (default 90), `HEALTHCHECK_DEGRADED_REALERT_H`
-(default 12), `HEALTHCHECK_NTFY_TOPIC`, `HEALTHCHECK_WEBHOOK`. With no channel
+(default 12; also the DeepSeek re-alert window), `HEALTHCHECK_NTFY_TOPIC`,
+`HEALTHCHECK_NTFY_EMAIL` (optional; adds ntfy's `Email:` header so every ntfy alert
+is also emailed), `HEALTHCHECK_WEBHOOK`. With no channel
 configured it still writes `trade_logs/healthcheck.log` and drops a marker file,
-and sends nothing outward.
+and sends nothing outward; the rate-limit markers are still written, so it does not
+repeat.
 
 ## Dashboard
 
@@ -192,7 +242,11 @@ redirect to `/` so old links still work.
 Model names in the footer and on the decision cards are derived from the logs at
 render time, never hand-written, so they cannot drift from what the bot actually
 called. Labels name the role (`Sentiment`) rather than the vendor, for the same
-reason: the provider behind that leg changes.
+reason: the provider behind that leg changes. The analyst badges (`DeepSeek: BUY`,
+`Gemini: HOLD`) are the one place a vendor is named, and it is the provider that
+actually answered, read from each row's model label (`ds:` → DeepSeek, `agy:`,
+`cli:` or `gemini…` → Gemini; empty, `none` or anything else → the generic `Analyst`).
+Static column headers just say `Analyst`.
 
 ```bash
 python3 dashboard/app.py
@@ -204,7 +258,7 @@ python3 dashboard/app.py
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
 llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
 tools/readme_rails.py  # derives the safety-rail table from trader.py (--check / --write)
-healthcheck.py         # run-freshness + degraded-LLM check, notifies via ntfy
+healthcheck.py         # run-freshness + degraded-LLM + DeepSeek-down check, notifies via ntfy
 requirements.txt
 dashboard/
   app.py               # Flask dashboard

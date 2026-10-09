@@ -10,12 +10,12 @@
 
 每次執行（平日 9:30–16:00 ET，每 30 分鐘一次）針對每批股票代碼執行以下流程：
 
-1. **市場數據 + 新聞** — 透過 yfinance 取得價格歷史，透過 Alpaca 新聞 API 取得新聞標題。
-2. **分析師**（Gemini）— 附帶信心度與理由的 BUY/SELL/HOLD 建議。沿著模型優先順序鏈（`gemini-3.8-flash` → `gemini-3.6-flash` → … → `gemini-3.1-flash-lite`）依序嘗試，以便在某個模型遇到額度限制時能平穩降級。
+1. **市場資料 + 新聞** — 透過 yfinance 取得價格歷史，透過 Alpaca 新聞 API 取得新聞標題。
+2. **分析師**（DeepSeek → agy → Gemini）— 附帶信心度與理由的 BUY/SELL/HOLD 建議。設定 `USE_DEEPSEEK=1` 時，會先透過本機反向代理詢問 DeepSeek V4.1 Flash（見下方*透過 deeperseeker 使用 DeepSeek*）；接著是 agy（`USE_AGY_GEMINI=1`，Gemini 訂閱額度）；最後才是 Gemini API，並沿著模型優先順序鏈（`gemini-3.8-flash` → `gemini-3.6-flash` → … → `gemini-3.1-flash-lite`）依序嘗試，以便在某個模型遇到額度限制時能平穩降級。每筆決策都會記下實際回答的模型：`ds:v4.1flash`、`agy:Gemini 3.8 Flash (High)`、`gemini-…`，整批失敗則為 `none`。
 3. **情緒分析**（DeepSeek → Cloudflare Workers AI）— BULLISH/BEARISH/NEUTRAL 的第二意見。僅在與分析師**直接衝突**時（BUY 對上 BEARISH，或 SELL 對上 BULLISH）才會阻擋交易；NEUTRAL（無重大新聞／空白新聞）不會行使否決權。模型鏈為 Hugging Face 的 `deepseek-ai/DeepSeek-V4.1-Flash`，接著是 Cloudflare Workers AI 的 `@cf/mistralai/mistral-small-3.1-24b-instruct` 與 `@cf/meta/llama-4-scout-17b-16e-instruct`。兩個後備刻意架在**不同的計費管道**上：舊的模型鏈四個全在 Hugging Face，額度一旦耗盡，四個會同時回傳 402。Cloudflare 免費層每日 10,000 Neurons，約等於 900 次情緒呼叫，因此在 Hugging Face 額度見底時這一段仍然存活。把答案放進 `reasoning` 而讓 `content` 空白的模型在此無法使用，排除依據是實測，不是名氣。
 4. **風險控管**（Claude）— 最終關卡；否決不安全的交易。在關鍵的出場決策上透過 Claude Agent SDK 使用 **Sonnet** — 運用您 **Claude Pro 方案內含額度** — 並使用 **Haiku** API 進行大批量的買入篩選；未設定訂閱 token 時會退回使用 Haiku。
 5. **執行** — Alpaca 模擬訂單；強制停損底線**與保護利潤的移動停損**皆獨立於 LLM 強制執行。
-6. **出場分析** — 未平倉部位由 Gemini 出場分析師與 Claude 出場風險關卡重新評估。設定 `USE_AGY_GEMINI=1` 時，出場分析師會透過 Antigravity CLI 使用 Google AI **訂閱**額度，任何失敗都會退回 Gemini API 鏈；未設定時則直接使用 API 鏈。（Google 於 2026-06-18 停用了個人層級的 `gemini-cli`；該路徑預設關閉 — 僅在具備付費金鑰支援的 CLI 時才設定 `USE_GEMINI_EXIT_CLI=1`。）
+6. **出場分析** — 未平倉部位由出場分析師與 Claude 出場風險關卡重新評估。出場分析師的順序與第 2 步相同：先 DeepSeek（`USE_DEEPSEEK=1`），再透過 Antigravity CLI 使用 Google AI **訂閱**額度（`USE_AGY_GEMINI=1`），最後是 Gemini API 鏈；每一段失敗都會退回下一段，兩個旗標都未設定時則直接使用 API 鏈。（Google 於 2026-06-18 停用了個人層級的 `gemini-cli`；該路徑預設關閉 — 僅在具備付費金鑰支援的 CLI 時才設定 `USE_GEMINI_EXIT_CLI=1`。）
 
    請留意這道關卡造成的不對稱：判定為 `HOLD` 時會在 Claude 關卡之前就返回，因此關卡能否決不當的出場，卻無法補救被漏掉的出場。
 
@@ -59,7 +59,9 @@ cp .env.example ~/.env        # fill in your keys
 
 **選用 — 透過訂閱使用 Claude Sonnet。** 若要透過 Claude Agent SDK 在 Claude **Sonnet** 上執行風險／出場關卡 — 運用您的 **Claude Pro 方案內含額度**而非按用量計費的 Haiku API token — 請新增 `CLAUDE_CODE_OAUTH_TOKEN`（來自 `claude setup-token`）。可微調參數：`CLAUDE_SDK_FOR`（`exits` [預設] | `all` | `none`）與 `CLAUDE_SDK_MODEL`（預設 `sonnet`）。若無 token，機器人將如以往般僅以 Haiku 執行。
 
-**選用 — 透過 Antigravity 訂閱使用 Gemini。** 設定 `USE_AGY_GEMINI=1` 可讓分析師與出場分析師改走 `agy` CLI，使用 Google AI 訂閱額度而非 Gemini API 金鑰。該額度以運算量計量、**每週**重置，因此耗盡後是數日的鎖定而非隔日恢復；agy 的任何失敗都會自動退回 API 鏈。可微調參數：`AGY_MODEL`（預設 `Gemini 3.8 Flash (High)`）、`AGY_BIN`、`AGY_TIMEOUT`。
+**選用 — 透過 deeperseeker 使用 DeepSeek。** 設定 `USE_DEEPSEEK=1` 後，DeepSeek V4.1 Flash 會成為分析師與出場分析師的第一段。它是透過 *deeperseeker* 存取的，這是一個本機、相容 OpenAI 介面的反向代理（預設 `http://127.0.0.1:4000/v1`），背後接的是**拋棄式的 DeepSeek 網頁版聊天帳號**。這種用法違反 DeepSeek 的服務條款（ToS），因此帳號隨時可能被封鎖、token 也隨時可能失效；兩者都會以 HTTP 錯誤（401/403/429/5xx）的形式出現。該代理在並行請求下會掛掉，所以 DeepSeek 的呼叫一律**循序**進行。每次執行都有一個**斷路器（circuit breaker）**：連續失敗 3 次之後，該次執行剩餘時間不再呼叫 DeepSeek，把一次故障的代價限制在幾次逾時之內。後備順序：DeepSeek → agy → Gemini API 鏈；DeepSeek 掛掉時，機器人損失的只是主要的那一段。可微調參數：`DEEPSEEK_BASE`（預設 `http://127.0.0.1:4000/v1`）、`DEEPSEEK_MODEL`（預設 `v4.1flash`）、`DEEPSEEK_API_KEY`（`USE_DEEPSEEK=1` 時必填）、`DEEPSEEK_TIMEOUT`（預設 75 秒）。這與情緒分析那一段使用的 Hugging Face `deepseek-ai/DeepSeek-V4.1-Flash`（第 3 步）是兩回事。無論由哪個模型回答，JSON 欄位為了與既有日誌相容，仍沿用 `gemini_*` 名稱。
+
+**選用 — 透過 Antigravity 訂閱使用 Gemini。** 設定 `USE_AGY_GEMINI=1` 可讓分析師與出場分析師改走 `agy` CLI，使用 Google AI 訂閱額度而非 Gemini API 金鑰。該額度以運算量計量、**每週**重置，因此耗盡後是數日的鎖定而非隔日恢復；agy 的任何失敗都會自動退回 API 鏈。若同時啟用 DeepSeek，agy 是第二段，僅在 DeepSeek 失敗後才會嘗試。可微調參數：`AGY_MODEL`（預設 `Gemini 3.8 Flash (High)`）、`AGY_BIN`、`AGY_TIMEOUT`。
 
 **選用 — 額度閥門。** 設定 `EXIT_GATE=1` 後，僅有股價低於 5 日均線的部位才會進行 LLM 出場複核。以 19,654 筆歷史複核實測：可減少約 65% 的出場分析師呼叫，同時仍能觸發 73% 的實際成交出場；市場資料不可用時採 fail-open（照常複核）。預設關閉 — 只有當瓶頸是額度而非準確度時，這筆交換才划算。
 
@@ -81,11 +83,23 @@ python3 trader.py
 
 `flock -n` 可避免在前一次執行較慢時發生重疊堆積。請根據您伺服器的時區調整小時範圍 — 機器人無論如何都會自行強制遵循 ET 時間窗口。
 
+請以相同頻率啟用 `healthcheck.py`。它刻意放在外部：促成它的那次故障，是 `trader.py` 在 *import* 階段就當掉，任何行程內的防護都來不及執行，因此唯一可靠的訊號就是最近是否有一次執行跑完。它有兩個彼此獨立的警報：**stale**（過期），即開盤時間內 `run_log.jsonl` 不再更新；以及 **degraded**（降級），即一次執行雖然完成，但整條情緒分析模型鏈全部失效，所有標的都被評為 NEUTRAL/0。第二個警報有頻率限制，並且刻意不動 stale 標記與結束碼，因為機器人還活著，只是在盲飛。
+
+第三個獨立警報負責 DeepSeek（僅在該次執行回報已啟用 DeepSeek 時）。上一次執行中斷路器跳脫時，healthcheck 會送出附帶最後一個錯誤的 **DeepSeek down** 訊息；若錯誤訊息中含有 `HTTP 401` 或 `HTTP 403`（trader.py 的錯誤格式為 `deepseek HTTP 401: ...`），還會附上提示：userToken 很可能已過期或被封鎖，需要重新驗證（re-auth）；其他錯誤（例如逾時，或提到 `max_tokens` 的訊息）則不附提示。它使用自己的標記檔 `trade_logs/DEEPSEEK_DOWN`，因此與 degraded 警報各自限頻（同為 12 小時窗口）。
+
+標記檔只有在警報確實送達（或根本沒有設定任何通道）時才會寫入，所以 ntfy／webhook 的 POST 失敗時，下一次執行會重送，而不是靜默 12 小時；不論送達與否，`healthcheck.log` 都會寫入一行。degraded 警報也是同樣的行為。DeepSeek 恢復回應時，healthcheck 會送出一次 **DeepSeek recovered** 訊息，但必須是一次乾淨的執行（至少成功呼叫一次、沒有任何失敗，且斷路器未跳脫）。標記檔不會被刪除，而是改寫成 `<原警報時間戳> RECOVERED`：原本的時間戳繼續替 down 警報限頻，`RECOVERED` 標記則讓 recovered 訊息每次故障只會送一次，因此時好時壞的 DeepSeek（掛、好、掛……）每 12 小時最多只會發一次警報，且同一次故障最多只送一則 recovered。窗口過後若再次發出警報，會覆寫標記並重新啟用下一則 recovered 訊息。沒有呼叫過 DeepSeek、或仍有失敗的執行不會動這個標記。與 degraded 警報一樣，它不會動 stale 標記或結束碼，因為機器人已經退回 agy/Gemini 並繼續交易。
+
+```cron
+*/30 9-15 * * 1-5 HEALTHCHECK_NTFY_TOPIC=your-topic /usr/bin/python3 /path/to/healthcheck.py
+```
+
+可微調參數：`HEALTHCHECK_MAX_AGE_MIN`（預設 90）、`HEALTHCHECK_DEGRADED_REALERT_H`（預設 12；同時也是 DeepSeek 的重複警報窗口）、`HEALTHCHECK_NTFY_TOPIC`、`HEALTHCHECK_NTFY_EMAIL`（選用；加上 ntfy 的 `Email:` 標頭，讓每則 ntfy 警報同時寄成電子郵件）、`HEALTHCHECK_WEBHOOK`。未設定任何通道時，仍會寫入 `trade_logs/healthcheck.log` 並留下標記檔，不會對外發送任何訊息；限頻標記檔照樣會寫入，因此不會重複。
+
 ## 儀表板
 
 位於 `dashboard/` 的小型 Flask 應用程式，用於顯示倉位、決策與歷史紀錄，提供**繁體中文與英文**兩種語言（於 `/lang/<code>` 切換，字串集中在 `i18n.py`）。總覽頁面繪製投資組合價值隨時間變化的圖表，並帶有**歷史高點線與回撤陰影**，持倉表格也已併入該頁 —— `/positions` 保留為導向 `/` 的轉址，舊連結仍然可用。
 
-頁尾與決策卡片上的模型名稱是在算繪當下從 log 推導出來的，不是手寫的，因此不可能與機器人實際呼叫的模型脫節。標籤描述的是**角色**（`Sentiment`）而非**廠商**，理由相同：那一段背後的供應商會換。
+頁尾與決策卡片上的模型名稱是在算繪當下從 log 推導出來的，不是手寫的，因此不可能與機器人實際呼叫的模型脫節。標籤描述的是**角色**（`Sentiment`）而非**廠商**，理由相同：那一段背後的供應商會換。分析師徽章（`DeepSeek: BUY`、`Gemini: HOLD`）是唯一點名廠商的地方，而且點的是實際回答的供應商，依每一列的模型標籤判斷（`ds:` → DeepSeek，`agy:`、`cli:` 或 `gemini…` → Gemini；空白、`none` 或其他 → 通用的 `Analyst`）；靜態的欄位標題則一律只寫 `Analyst`。
 
 ```bash
 python3 dashboard/app.py
@@ -97,7 +111,7 @@ python3 dashboard/app.py
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
 llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
 tools/readme_rails.py  # derives the safety-rail table from trader.py (--check / --write)
-healthcheck.py         # run-freshness + degraded-LLM check, notifies via ntfy
+healthcheck.py         # run-freshness + degraded-LLM + DeepSeek-down check, notifies via ntfy
 requirements.txt
 dashboard/
   app.py               # Flask dashboard

@@ -138,12 +138,12 @@ const FIELD_LABELS = {
   run_timestamp:       'Run Time',
   ticker:              T('col.ticker'),
   action:              T('col.action'),
-  recommendation:      'Gemini Rec.',
+  recommendation:      'Analyst Rec.',
   final_action:        T('lbl.final_action'),
-  gemini_recommendation: 'Gemini Rec.',
-  gemini_confidence:   'Gemini Confidence',
-  gemini_model:        'Gemini Model',
-  gemini_reasoning:    T('lbl.gemini_reasoning'),
+  gemini_recommendation: 'Analyst Rec.',
+  gemini_confidence:   'Analyst Confidence',
+  gemini_model:        'Analyst Model',
+  gemini_reasoning:    T('lbl.analyst_reasoning', {p: 'Analyst'}),
   confidence:          T('lbl.confidence'),
   reasoning:           T('lbl.reasoning'),
   hf_sentiment:        T('lbl.hf_sentiment'),
@@ -167,6 +167,15 @@ const FIELD_LABELS = {
   volume: T('lbl.volume'),
 };
 
+
+// Provider that answered, from the row's model label. Mirrors llm_provider()
+// in app.py (the Jinja filter the decisions page uses); keep the two in sync.
+function llmProvider(model) {
+  const m = String(model || '').trim().toLowerCase();
+  if (m.startsWith('ds:')) return 'DeepSeek';
+  if (m.startsWith('agy:') || m.startsWith('cli:') || m.startsWith('gemini')) return 'Gemini';
+  return 'Analyst';
+}
 
 function fmtValue(key, val) {
   if (val === null || val === undefined || val === '') return '<span class="hint">—</span>';
@@ -232,7 +241,7 @@ function renderModal(row) {
       `<div class="pipe-t">${T('lbl.market_at_run')}</div><div class="pipe-card">${mkeys.map(k => kv(FIELD_LABELS[k]||k, k)).join('')}</div></div>`;
   }
 
-  // Stage 2 — AI analysis (Gemini + sentiment)
+  // Stage 2 — AI analysis (analyst + sentiment)
   const gRec = pick('gemini_recommendation','recommendation','gemini_exit_action');
   const gConf = pick('gemini_confidence','confidence','gemini_exit_confidence');
   const gModel = pick('gemini_model','gemini_exit_model');
@@ -240,7 +249,7 @@ function renderModal(row) {
   const hfSent = pick('hf_sentiment');
   if (gRec || gReas || hfSent) {
     html += `<div class="pipe-step info"><div class="pipe-ic"><i class="bi bi-cpu"></i></div><div class="pipe-t">${T('lbl.ai_analysis')}</div><div class="pipe-card">`;
-    if (gRec || gConf || gModel || gReas) html += `<div class="mb-1"><i class="bi bi-stars me-1 text-info"></i><span class="fw-semibold text-white">Gemini</span></div>`;
+    if (gRec || gConf || gModel || gReas) html += `<div class="mb-1"><i class="bi bi-stars me-1 text-info"></i><span class="fw-semibold text-white">${escHtml(llmProvider(gModel ? row[gModel] : ''))}</span></div>`;
     html += kv(T('js.recommendation'), gRec) + kv(T('lbl.confidence'), gConf) + kv(T('lbl.model'), gModel) + longText(T('lbl.reasoning'), gReas);
     if (hfSent && String(row[hfSent]).toUpperCase() !== 'N/A') {
       html += `<div class="mt-2 pt-2 border-top border-secondary-subtle"><i class="bi bi-newspaper me-1 text-warning"></i><span class="fw-semibold text-white">Sentiment</span></div>`;

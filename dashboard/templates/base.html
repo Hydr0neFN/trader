@@ -53,9 +53,10 @@
   {% block content %}{% endblock %}
 </div>
 
-{# Model names are read from the logs, not written here: the Gemini model is
-   picked at runtime from a fallback chain (or from agy), Claude answers on two
-   tiers, and the sentiment agent changes. A hand-written list went stale. #}
+{# Model names are read from the logs, not written here: the analyst is picked
+   at runtime (DeepSeek via deeperseeker, then agy, then the Gemini API chain),
+   Claude answers on two tiers, and the sentiment agent changes. A hand-written
+   list went stale. #}
 <footer class="text-center mt-5 mb-3 hint">
   <div>{{ t('footer.trader') }}</div>
   {% if active_models %}

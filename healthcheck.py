@@ -19,6 +19,8 @@ Alert channels (all optional, no outward send by default):
   - always: append to trade_logs/healthcheck.log and touch trade_logs/STALE
   - HEALTHCHECK_NTFY_TOPIC  -> POST to https://ntfy.sh/<topic>
   - HEALTHCHECK_WEBHOOK     -> POST {"text": msg} as JSON
+  - HEALTHCHECK_NTFY_EMAIL  -> add an `Email: <addr>` header to the ntfy POSTs, so
+                               ntfy.sh also forwards each alert by email
 
 Exit code: 0 healthy, 1 stale (so cron `|| ...` can react too).
 
@@ -31,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.request
 from datetime import datetime, time as dtime, timezone
@@ -42,6 +45,9 @@ RUN_LOG      = LOG_DIR / "run_log.jsonl"
 HEALTH_LOG   = LOG_DIR / "healthcheck.log"
 STALE_MARKER = LOG_DIR / "STALE"
 DEGRADED_MARKER = LOG_DIR / "DEGRADED"
+# Own marker (and so its own rate limit) for the DeepSeek breaker, so a sentiment
+# alert can never suppress a DeepSeek one or the other way round.
+DEEPSEEK_MARKER = LOG_DIR / "DEEPSEEK_DOWN"
 MAX_AGE_MIN  = int(os.environ.get("HEALTHCHECK_MAX_AGE_MIN", "90"))
 # Re-alert on a still-degraded LLM chain at most this often, so a multi-day
 # outage is loud on day one without spamming every 30 min after that.
@@ -129,17 +135,61 @@ def last_run_complete() -> dict | None:
     return found
 
 
-def notify_degraded(msg: str) -> None:
+def _send(msg: str, title: str, priority: str) -> bool:
+    """POST msg to ntfy (and the webhook), whichever are configured; never raise.
+
+    True if at least one channel took it, or if none is configured (nothing to
+    retry). Rate-limit markers are only written on True, so an ntfy outage at
+    alert time retries next run instead of going silent for DEGRADED_REALERT_H.
+    """
+    topic = os.environ.get("HEALTHCHECK_NTFY_TOPIC")
+    hook = os.environ.get("HEALTHCHECK_WEBHOOK")
+    delivered = not (topic or hook)
+    if topic:
+        try:
+            headers = {"Title": title, "Priority": priority}
+            email = os.environ.get("HEALTHCHECK_NTFY_EMAIL")
+            if email:
+                headers["Email"] = email
+            req = urllib.request.Request(
+                f"https://ntfy.sh/{topic}",
+                data=msg.encode(),
+                headers=headers,
+            )
+            urllib.request.urlopen(req, timeout=15)
+            delivered = True
+        except Exception:
+            pass
+
+    if hook:
+        try:
+            req = urllib.request.Request(
+                hook,
+                data=json.dumps({"text": msg}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=15)
+            delivered = True
+        except Exception:
+            pass
+    return delivered
+
+
+def notify_degraded(msg: str, marker: Path | None = None,
+                    title: str = "trader degraded") -> None:
     """Alert that the bot is running but an LLM leg is dead.
 
     Separate from notify(): trader.py is alive, so this must not raise the
     STALE marker or change the exit code. Rate-limited via its own marker
     file -- the 2026-09 HuggingFace 402 outage ran 5 days with nothing but
     WARNING lines in cron.log, which is exactly what this closes.
+    Each failure kind passes its own `marker` (default: DEGRADED_MARKER) so
+    they rate-limit independently.
     """
+    marker = marker or DEGRADED_MARKER
     now = datetime.now(timezone.utc)
     try:
-        prev = datetime.fromisoformat(DEGRADED_MARKER.read_text().split()[0])
+        prev = datetime.fromisoformat(marker.read_text().split()[0])
         if (now - prev).total_seconds() < DEGRADED_REALERT_H * 3600:
             return
     except (OSError, ValueError, IndexError, TypeError):
@@ -149,32 +199,39 @@ def notify_degraded(msg: str) -> None:
     try:
         with HEALTH_LOG.open("a") as f:
             f.write(f"{ts} DEGRADED {msg}\n")
-        DEGRADED_MARKER.write_text(f"{ts} {msg}\n")
     except OSError:
         pass
 
-    topic = os.environ.get("HEALTHCHECK_NTFY_TOPIC")
-    if topic:
+    if _send(msg, title, "default"):
         try:
-            req = urllib.request.Request(
-                f"https://ntfy.sh/{topic}",
-                data=msg.encode(),
-                headers={"Title": "trader degraded", "Priority": "default"},
-            )
-            urllib.request.urlopen(req, timeout=15)
-        except Exception:
+            marker.write_text(f"{ts} {msg}\n")
+        except OSError:
             pass
 
-    hook = os.environ.get("HEALTHCHECK_WEBHOOK")
-    if hook:
+
+def notify_recovered(msg: str, marker: Path, title: str) -> None:
+    """One-shot "it's back" message.
+
+    The marker is rewritten as "<original alert ts> RECOVERED", never deleted:
+    its first field is what notify_degraded rate-limits on, so a flapping leg
+    (down, up, down, ...) still alerts at most once per DEGRADED_REALERT_H
+    instead of once per run. The RECOVERED tag is what makes this one-shot.
+    """
+    try:
+        parts = marker.read_text().split()
+    except OSError:
+        return
+    if not parts or "RECOVERED" in parts:
+        return
+    try:
+        with HEALTH_LOG.open("a") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} RECOVERED {msg}\n")
+    except OSError:
+        pass
+    if _send(msg, title, "default"):
         try:
-            req = urllib.request.Request(
-                hook,
-                data=json.dumps({"text": msg}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(req, timeout=15)
-        except Exception:
+            marker.write_text(f"{parts[0]} RECOVERED\n")
+        except OSError:
             pass
 
 
@@ -188,29 +245,7 @@ def notify(msg: str) -> None:
     except OSError:
         pass
 
-    topic = os.environ.get("HEALTHCHECK_NTFY_TOPIC")
-    if topic:
-        try:
-            req = urllib.request.Request(
-                f"https://ntfy.sh/{topic}",
-                data=msg.encode(),
-                headers={"Title": "trader watchdog", "Priority": "high"},
-            )
-            urllib.request.urlopen(req, timeout=15)
-        except Exception:
-            pass
-
-    hook = os.environ.get("HEALTHCHECK_WEBHOOK")
-    if hook:
-        try:
-            req = urllib.request.Request(
-                hook,
-                data=json.dumps({"text": msg}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(req, timeout=15)
-        except Exception:
-            pass
+    _send(msg, "trader watchdog", "high")
 
 
 def main() -> int:
@@ -267,6 +302,30 @@ def main() -> int:
                 DEGRADED_MARKER.unlink()
             except OSError:
                 pass
+
+        # DeepSeek is the primary analyst; once the breaker trips the run falls
+        # back to agy/Gemini and keeps trading, so nothing else would notice.
+        # Old run_complete lines lack these keys and fall through both branches.
+        if rec.get("deepseek_enabled"):
+            ds_ok = rec.get("deepseek_ok") or 0
+            if rec.get("deepseek_tripped"):
+                err = rec.get("deepseek_last_error") or "unknown"
+                msg = (f"DeepSeek down: circuit breaker tripped last run "
+                       f"({rec.get('deepseek_failed', 0)} failed, {ds_ok} ok) -- "
+                       f"bot fell back to agy/Gemini. Last error: {err}")
+                # Match the status trader.py puts in the message ("deepseek HTTP
+                # 401: ..."), not a bare "token" -- that also hits max_tokens errors.
+                if re.search(r"\bHTTP 40[13]\b", err):
+                    msg += (" | The DeepSeek userToken probably expired or was banned. "
+                            "Fix: re-auth via ssh -L 4001:127.0.0.1:4000 root@192.168.1.10 "
+                            "then http://127.0.0.1:4001/dashboard")
+                notify_degraded(msg, DEEPSEEK_MARKER, "DeepSeek down")
+            elif ds_ok > 0 and not rec.get("deepseek_failed") and DEEPSEEK_MARKER.exists():
+                # A clean run (ok > 0, failed == 0) is what proves it works; a run
+                # that never called DeepSeek (ok == failed == 0) or still saw
+                # failures must leave the marker alone.
+                notify_recovered("DeepSeek recovered: analyst calls succeed again",
+                                 DEEPSEEK_MARKER, "DeepSeek recovered")
 
     # Healthy — clear any prior stale marker.
     try:
