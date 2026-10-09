@@ -247,24 +247,41 @@ def find_entry_date(ticker: str) -> datetime | None:
         return None
 
 
+# ticker -> (run_timestamp, reasoning) of its newest BUY_EXECUTED decision; built
+# once per process (each cron run is a fresh process).
+_buy_reasoning_index: dict | None = None
+
+
 def find_original_buy_reasoning(ticker: str) -> str:
-    """Return the Gemini reasoning from the most recent BUY decision for ticker."""
-    dec_file = LOG_DIR / "decisions.jsonl"
-    if not dec_file.exists():
-        return ""
-    best_ts = ""
-    best_reasoning = ""
-    for line in dec_file.read_text().splitlines():
+    """Return the Gemini reasoning from the most recent BUY decision for ticker.
+
+    decisions.jsonl is >100 MB and append-only. This used to read_text() the
+    whole file once per open position (24 x 118 MB per run on a 4 GB Pi that
+    shares its RAM with Home Assistant), so it now streams the file once per
+    run and only json-parses the few lines that can be a BUY_EXECUTED row.
+    """
+    global _buy_reasoning_index
+    if _buy_reasoning_index is None:
+        _buy_reasoning_index = {}
+        dec_file = LOG_DIR / "decisions.jsonl"
         try:
-            rec = json.loads(line)
-            if (rec.get("ticker") == ticker
-                    and rec.get("final_action", "").upper() == "BUY_EXECUTED"
-                    and rec.get("run_timestamp", "") > best_ts):
-                best_ts = rec["run_timestamp"]
-                best_reasoning = rec.get("gemini_reasoning", "")
-        except Exception:
+            with open(dec_file, "rb") as fh:
+                for raw in fh:
+                    # Cheap byte prefilter; the exact check is below.
+                    if b"BUY_EXECUTED" not in raw.upper():
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                        tk = rec.get("ticker")
+                        ts = rec.get("run_timestamp", "")
+                        if (rec.get("final_action", "").upper() == "BUY_EXECUTED"
+                                and ts > _buy_reasoning_index.get(tk, ("",))[0]):
+                            _buy_reasoning_index[tk] = (ts, rec.get("gemini_reasoning", ""))
+                    except Exception:
+                        pass
+        except OSError:
             pass
-    return best_reasoning
+    return _buy_reasoning_index.get(ticker, ("", ""))[1]
 
 
 # ── Market hours check ────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -127,6 +128,116 @@ def tail_jsonl(filename: str, n: int) -> list:
             except json.JSONDecodeError:
                 pass
     return out
+
+
+# ── decisions.jsonl: byte-offset index instead of a cached parsed list ────────
+#
+# decisions.jsonl is >100 MB and append-only. Caching the parsed records cost
+# ~400 MB RSS per worker (OOM on the shared Pi), so we stream it once, keep only
+# a tiny index (run_timestamp / ticker / type / parsed time / byte offset per
+# record) and re-read just the records a page actually renders. The index is
+# extended incrementally when the file grows, so a cron run costs one small read
+# rather than a full re-parse.
+
+_dec_lock = threading.Lock()
+_dec_index: dict = {}
+
+
+def _new_dec_index() -> dict:
+    return {"size": 0, "mtime": None, "end": 0, "head": b"",
+            "by_run": {}, "by_ticker": {}, "dts": {}, "strs": {}}
+
+
+def _dec_index_for(path: Path) -> dict:
+    """Index of decisions.jsonl, rebuilt/extended only when the file changed."""
+    try:
+        st = path.stat()
+    except OSError:
+        return _new_dec_index()
+    idx = _dec_index.get("idx")
+    if idx and idx["mtime"] == st.st_mtime and idx["size"] == st.st_size:
+        return idx
+    with _dec_lock:
+        idx = _dec_index.get("idx")
+        if idx and idx["mtime"] == st.st_mtime and idx["size"] == st.st_size:
+            return idx
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            return idx or _new_dec_index()
+        with fh:
+            head = fh.read(256)
+            # Rebuild from scratch unless this is the same file that only grew.
+            if (not idx or idx.get("ino") != st.st_ino or st.st_size < idx["end"]
+                    or head[:len(idx["head"])] != idx["head"]):
+                idx = _new_dec_index()
+                idx["ino"] = st.st_ino
+            idx["head"] = head if len(head) > len(idx["head"]) else idx["head"]
+            fh.seek(idx["end"])
+            off = idx["end"]
+            strs, dts = idx["strs"], idx["dts"]
+            for raw in fh:
+                line_off, off = off, off + len(raw)
+                if not raw.endswith(b"\n"):
+                    # Unterminated tail: the writer may not be done with it even
+                    # if it already parses. Index it once its newline lands.
+                    off = line_off
+                    break
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except Exception:      # ValueError, but also RecursionError & co.
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                run = d.get("run_timestamp")
+                if isinstance(run, str):
+                    run = strs.setdefault(run, run)   # share one str per run
+                    idx["by_run"].setdefault(run, []).append(line_off)
+                    if run not in dts:
+                        dts[run] = parse_dt(run)
+                    dt = dts[run]
+                else:
+                    dt = parse_dt(run)
+                tk = d.get("ticker", "")
+                if isinstance(tk, str):
+                    tk = strs.setdefault(tk, tk)
+                    dtype = d.get("decision_type")
+                    if isinstance(dtype, str):
+                        dtype = strs.setdefault(dtype, dtype)
+                    else:
+                        dtype = None
+                    idx["by_ticker"].setdefault(tk, []).append((dt, dtype, line_off))
+            idx["end"] = off
+        idx["size"], idx["mtime"] = st.st_size, st.st_mtime
+        _dec_index["idx"] = idx
+        return idx
+
+
+def _read_dec_at(path: Path, offsets) -> list:
+    """Parse the decisions.jsonl records that start at the given byte offsets."""
+    out = []
+    try:
+        with open(path, "rb") as fh:
+            for off in offsets:
+                fh.seek(off)
+                try:
+                    out.append(json.loads(fh.readline()))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def decisions_for_run(run_ts: str) -> list:
+    """Every decisions.jsonl record whose run_timestamp == run_ts (file order)."""
+    path = LOG_DIR / "decisions.jsonl"
+    if not path.exists():
+        return []
+    return _read_dec_at(path, _dec_index_for(path)["by_run"].get(run_ts, ()))
 
 
 def _clean_model_id(raw) -> str:
@@ -456,16 +567,13 @@ def history():
     executed = read_jsonl("executed.jsonl")
     vetoed   = read_jsonl("vetoed.jsonl")
 
-    # Build decisions lookup by ticker, pre-parsing each run_timestamp ONCE.
-    # decisions.jsonl has tens of thousands of records; parsing datetimes inside
-    # find_decision (called per executed/vetoed row) was O(rows × decisions) and
-    # blew the worker timeout. Pre-parsing here makes each match O(candidates)
-    # comparisons with no repeated parsing.
-    all_decisions = read_jsonl("decisions.jsonl")
-    dec_by_ticker: dict = {}
-    for d in all_decisions:
-        dt = parse_dt(d.get("run_timestamp"))
-        dec_by_ticker.setdefault(d.get("ticker", ""), []).append((dt, d))
+    # decisions.jsonl is >100 MB: never load it whole. _dec_index_for() streams it
+    # once into a small per-ticker index (pre-parsed run time, decision_type, byte
+    # offset); find_decision() picks the best candidate from the index and only
+    # that one record is read back from disk. Rows are O(candidates) with no
+    # repeated datetime parsing, and memory stays bounded by the index.
+    dec_path = LOG_DIR / "decisions.jsonl"
+    dec_by_ticker: dict = _dec_index_for(dec_path)["by_ticker"] if dec_path.exists() else {}
 
     def find_decision(ticker: str, ts_str: str, want_type: str = "") -> dict:
         """Closest-in-time decision for (ticker, ts), within one cron interval.
@@ -479,19 +587,20 @@ def history():
             return {}
         candidates = dec_by_ticker.get(ticker, [])
         if want_type:
-            typed = [(dt, d) for dt, d in candidates if d.get("decision_type") == want_type]
+            typed = [c for c in candidates if c[1] == want_type]
             candidates = typed or candidates
         best = None
         best_delta = None
-        for dt, d in candidates:
+        for dt, _dtype, off in candidates:
             if dt is None:
                 continue
             delta = abs((dt - ts).total_seconds())
             if best_delta is None or delta < best_delta:
-                best_delta, best = delta, d
+                best_delta, best = delta, off
         if best is None or best_delta > 1800:
             return {}
-        return best
+        recs = _read_dec_at(dec_path, (best,))
+        return recs[0] if recs else {}
 
     # Tag raw rows, combine, sort, and FILTER before the expensive per-row
     # decision enrichment. With thousands of historical vetoes, enriching every
@@ -553,7 +662,6 @@ def history():
 
 @app.route("/decisions")
 def decisions():
-    all_decisions = read_jsonl("decisions.jsonl")
     run_logs      = read_jsonl("run_log.jsonl")
 
     run_timestamps = []
@@ -570,7 +678,8 @@ def decisions():
     dtype_filter  = request.args.get("dtype",  "").strip()
 
     # All decisions for this run (for dropdown population)
-    all_run_decisions = [d for d in all_decisions if d.get("run_timestamp") == selected_ts]
+    # (only this run's records are read from the large decisions.jsonl)
+    all_run_decisions = decisions_for_run(selected_ts)
     all_tickers       = sorted({d.get("ticker", "") for d in all_run_decisions})
 
     run_decisions = list(all_run_decisions)

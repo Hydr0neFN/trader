@@ -87,13 +87,34 @@ python3 trader.py
 
 第三個獨立警報負責 DeepSeek（僅在該次執行回報已啟用 DeepSeek 時）。上一次執行中斷路器跳脫時，healthcheck 會送出附帶最後一個錯誤的 **DeepSeek down** 訊息；若錯誤訊息中含有 `HTTP 401` 或 `HTTP 403`（trader.py 的錯誤格式為 `deepseek HTTP 401: ...`），還會附上提示：userToken 很可能已過期或被封鎖，需要重新驗證（re-auth）；其他錯誤（例如逾時，或提到 `max_tokens` 的訊息）則不附提示。它使用自己的標記檔 `trade_logs/DEEPSEEK_DOWN`，因此與 degraded 警報各自限頻（同為 12 小時窗口）。
 
-標記檔只有在警報確實送達（或根本沒有設定任何通道）時才會寫入，所以 ntfy／webhook 的 POST 失敗時，下一次執行會重送，而不是靜默 12 小時；不論送達與否，`healthcheck.log` 都會寫入一行。degraded 警報也是同樣的行為。DeepSeek 恢復回應時，healthcheck 會送出一次 **DeepSeek recovered** 訊息，但必須是一次乾淨的執行（至少成功呼叫一次、沒有任何失敗，且斷路器未跳脫）。標記檔不會被刪除，而是改寫成 `<原警報時間戳> RECOVERED`：原本的時間戳繼續替 down 警報限頻，`RECOVERED` 標記則讓 recovered 訊息每次故障只會送一次，因此時好時壞的 DeepSeek（掛、好、掛……）每 12 小時最多只會發一次警報，且同一次故障最多只送一則 recovered。窗口過後若再次發出警報，會覆寫標記並重新啟用下一則 recovered 訊息。沒有呼叫過 DeepSeek、或仍有失敗的執行不會動這個標記。與 degraded 警報一樣，它不會動 stale 標記或結束碼，因為機器人已經退回 agy/Gemini 並繼續交易。
+標記檔只有在警報確實送達（或根本沒有設定任何通道）時才會寫入，所以所有通道（ntfy、webhook、電子郵件）都失敗時，下一次執行會重送，而不是靜默 12 小時；不論送達與否，`healthcheck.log` 都會寫入一行。degraded 警報也是同樣的行為。DeepSeek 恢復回應時，healthcheck 會送出一次 **DeepSeek recovered** 訊息，但必須是一次乾淨的執行（至少成功呼叫一次、沒有任何失敗，且斷路器未跳脫）。標記檔不會被刪除，而是改寫成 `<原警報時間戳> RECOVERED`：原本的時間戳繼續替 down 警報限頻，`RECOVERED` 標記則讓 recovered 訊息每次故障只會送一次，因此時好時壞的 DeepSeek（掛、好、掛……）每 12 小時最多只會發一次警報，且同一次故障最多只送一則 recovered。窗口過後若再次發出警報，會覆寫標記並重新啟用下一則 recovered 訊息。沒有呼叫過 DeepSeek、或仍有失敗的執行不會動這個標記。與 degraded 警報一樣，它不會動 stale 標記或結束碼，因為機器人已經退回 agy/Gemini 並繼續交易。
 
 ```cron
 */30 9-15 * * 1-5 HEALTHCHECK_NTFY_TOPIC=your-topic /usr/bin/python3 /path/to/healthcheck.py
 ```
 
-可微調參數：`HEALTHCHECK_MAX_AGE_MIN`（預設 90）、`HEALTHCHECK_DEGRADED_REALERT_H`（預設 12；同時也是 DeepSeek 的重複警報窗口）、`HEALTHCHECK_NTFY_TOPIC`、`HEALTHCHECK_NTFY_EMAIL`（選用；加上 ntfy 的 `Email:` 標頭，讓每則 ntfy 警報同時寄成電子郵件）、`HEALTHCHECK_WEBHOOK`。未設定任何通道時，仍會寫入 `trade_logs/healthcheck.log` 並留下標記檔，不會對外發送任何訊息；限頻標記檔照樣會寫入，因此不會重複。
+可微調參數：`HEALTHCHECK_MAX_AGE_MIN`（預設 90）、`HEALTHCHECK_DEGRADED_REALERT_H`（預設 12；同時也是 DeepSeek 的重複警報窗口）、`HEALTHCHECK_NTFY_TOPIC`、`HEALTHCHECK_WEBHOOK`、`HEALTHCHECK_SMTP_FILE`（下方電子郵件設定檔的路徑）。未設定任何通道時，仍會寫入 `trade_logs/healthcheck.log` 並留下標記檔，不會對外發送任何訊息；限頻標記檔照樣會寫入，因此不會重複。
+
+**電子郵件（Gmail SMTP）。** 只要存在僅限 root 讀取的設定檔，每一則警報（stale、degraded、DeepSeek down、recovered）都會同時寄出電子郵件。設定放在檔案而不是環境變數，是因為 crontab 會出現在列表輸出中，密碼也會跟著外洩。路徑為 `$HEALTHCHECK_SMTP_FILE`，預設 `/root/.healthcheck-smtp`；檔案不存在時，電子郵件通道就是關閉的。
+
+```ini
+# /root/.healthcheck-smtp  (chmod 600)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=you@gmail.com
+SMTP_PASS="abcd efgh ijkl mnop"
+SMTP_TO=you@gmail.com, other@example.com
+SMTP_FROM=you@gmail.com
+```
+
+```bash
+chmod 600 /root/.healthcheck-smtp
+python3 /path/to/healthcheck.py --test-email
+```
+
+`SMTP_HOST`（預設 `smtp.gmail.com`）、`SMTP_PORT`（預設 587，使用 STARTTLS；465 則使用隱式 TLS）與 `SMTP_FROM`（預設為 `SMTP_USER`）皆為選填；`SMTP_USER`、`SMTP_PASS` 與 `SMTP_TO`（可用逗號分隔多個收件人）為必填，缺任何一個，電子郵件通道就維持關閉。`SMTP_PASS` 是 Google 應用程式密碼（需啟用兩步驟驗證），Google 顯示時所帶的空格會被自動移除。以 `#` 開頭的行視為註解，值可以加引號。`--test-email` 會透過所有已設定的通道送出一則測試訊息、印出哪些通道成功送達，只要至少有一個成功就以結束碼 0 離開，否則為 1；它不會寫入任何標記檔。寄信失敗時，`healthcheck.log` 會記錄一行 `EMAIL_FAIL <錯誤>`（絕不包含密碼）；只要 ntfy 或 webhook 已送出該警報，仍視為已送達。
+
+不支援匿名的 ntfy 電子郵件：ntfy.sh 會以 HTTP 400（`anonymous email sending is not allowed`）拒絕 `Email:` 標頭，連推播也會一併失敗，因此 `HEALTHCHECK_NTFY_EMAIL` 已移除。請改用上述的 SMTP 設定檔。
 
 ## 儀表板
 
@@ -111,7 +132,7 @@ python3 dashboard/app.py
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
 llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
 tools/readme_rails.py  # derives the safety-rail table from trader.py (--check / --write)
-healthcheck.py         # run-freshness + degraded-LLM + DeepSeek-down check, notifies via ntfy
+healthcheck.py         # run-freshness + degraded-LLM + DeepSeek-down check, notifies via ntfy / webhook / email
 requirements.txt
 dashboard/
   app.py               # Flask dashboard

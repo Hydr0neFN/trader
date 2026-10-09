@@ -205,7 +205,7 @@ as a timeout or a `max_tokens` complaint, get no hint. It keeps its own marker,
 (same 12 h window).
 
 The marker is written only once an alert was actually delivered (or no channel is
-configured), so a failed ntfy/webhook POST is retried on the next run instead of going
+configured), so when every channel (ntfy, webhook, email) fails the alert is retried on the next run instead of going
 silent for 12 h; the `healthcheck.log` line is written either way. This holds for the
 degraded alert too. When DeepSeek answers again, healthcheck sends one **DeepSeek
 recovered** message, but only after a clean run (at least one successful call and no
@@ -225,11 +225,45 @@ already fallen back to agy/Gemini and kept trading.
 
 Tunables: `HEALTHCHECK_MAX_AGE_MIN` (default 90), `HEALTHCHECK_DEGRADED_REALERT_H`
 (default 12; also the DeepSeek re-alert window), `HEALTHCHECK_NTFY_TOPIC`,
-`HEALTHCHECK_NTFY_EMAIL` (optional; adds ntfy's `Email:` header so every ntfy alert
-is also emailed), `HEALTHCHECK_WEBHOOK`. With no channel
-configured it still writes `trade_logs/healthcheck.log` and drops a marker file,
-and sends nothing outward; the rate-limit markers are still written, so it does not
-repeat.
+`HEALTHCHECK_WEBHOOK`, `HEALTHCHECK_SMTP_FILE` (path of the email config below). With
+no channel configured it still writes `trade_logs/healthcheck.log` and drops a marker
+file, and sends nothing outward; the rate-limit markers are still written, so it does
+not repeat.
+
+**Email (Gmail SMTP).** Every alert (stale, degraded, DeepSeek down, recovered) is
+also emailed when a root-only config file exists. It is a file, not env vars, because
+a crontab shows up in listings and the password would leak with it. The path is
+`$HEALTHCHECK_SMTP_FILE`, default `/root/.healthcheck-smtp`; if the file is missing,
+email is simply off.
+
+```ini
+# /root/.healthcheck-smtp  (chmod 600)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=you@gmail.com
+SMTP_PASS="abcd efgh ijkl mnop"
+SMTP_TO=you@gmail.com, other@example.com
+SMTP_FROM=you@gmail.com
+```
+
+```bash
+chmod 600 /root/.healthcheck-smtp
+python3 /path/to/healthcheck.py --test-email
+```
+
+`SMTP_HOST` (default `smtp.gmail.com`), `SMTP_PORT` (default 587, STARTTLS; 465 uses
+implicit TLS) and `SMTP_FROM` (default `SMTP_USER`) are optional; `SMTP_USER`,
+`SMTP_PASS` and `SMTP_TO` (comma-separated) are required, otherwise email stays off.
+`SMTP_PASS` is a Google App Password (needs 2-Step Verification); the spaces Google
+shows in it are stripped. Lines starting with `#` are comments and values may be
+quoted. `--test-email` sends one test message through every configured channel,
+prints which accepted it, and exits 0 if at least one did, else 1; it writes no
+marker file. A failed email is logged to `healthcheck.log` as `EMAIL_FAIL <error>`
+(never the password) and counts as delivered if ntfy or the webhook took the alert.
+
+Anonymous ntfy email is not supported: ntfy.sh rejects the `Email:` header with HTTP
+400 (`anonymous email sending is not allowed`) and drops the push along with it, so
+`HEALTHCHECK_NTFY_EMAIL` no longer exists. Use the SMTP file instead.
 
 ## Dashboard
 
@@ -258,7 +292,7 @@ python3 dashboard/app.py
 trader.py              # main pipeline (data → analyst → sentiment → risk → execute → exit)
 llm_cost_report.py     # read-only summary of trade_logs/llm_calls.jsonl
 tools/readme_rails.py  # derives the safety-rail table from trader.py (--check / --write)
-healthcheck.py         # run-freshness + degraded-LLM + DeepSeek-down check, notifies via ntfy
+healthcheck.py         # run-freshness + degraded-LLM + DeepSeek-down check, notifies via ntfy / webhook / email
 requirements.txt
 dashboard/
   app.py               # Flask dashboard

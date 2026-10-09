@@ -19,8 +19,23 @@ Alert channels (all optional, no outward send by default):
   - always: append to trade_logs/healthcheck.log and touch trade_logs/STALE
   - HEALTHCHECK_NTFY_TOPIC  -> POST to https://ntfy.sh/<topic>
   - HEALTHCHECK_WEBHOOK     -> POST {"text": msg} as JSON
-  - HEALTHCHECK_NTFY_EMAIL  -> add an `Email: <addr>` header to the ntfy POSTs, so
-                               ntfy.sh also forwards each alert by email
+  - SMTP email (Gmail by default) -> configured by a root-only KEY=VALUE file, not
+                               env/crontab (a crontab is shown in listings, and the
+                               password would leak). Path: $HEALTHCHECK_SMTP_FILE,
+                               default /root/.healthcheck-smtp; no file = email off.
+                               Keys: SMTP_HOST (smtp.gmail.com), SMTP_PORT (587; 465
+                               uses SMTP_SSL), SMTP_USER, SMTP_PASS (an App Password;
+                               spaces are stripped), SMTP_TO (comma-separated),
+                               SMTP_FROM (default SMTP_USER). USER, PASS and TO are
+                               required, else email stays off.
+                               ntfy.sh's own anonymous `Email:` header is rejected by
+                               the server (HTTP 400, code 40053) and kills the push
+                               too, so it is deliberately not supported.
+
+Check the setup without waiting for an incident:
+  python3 healthcheck.py --test-email
+sends one test message through every configured channel, prints which accepted it,
+and exits 0 if at least one did, else 1. It writes no marker file.
 
 Exit code: 0 healthy, 1 stale (so cron `|| ...` can react too).
 
@@ -31,12 +46,16 @@ Cron (arm alongside trader.py, weekday market-hours in your server TZ):
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
+import smtplib
+import ssl
 import sys
 import urllib.request
 from datetime import datetime, time as dtime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -135,31 +154,105 @@ def last_run_complete() -> dict | None:
     return found
 
 
-def _send(msg: str, title: str, priority: str) -> bool:
-    """POST msg to ntfy (and the webhook), whichever are configured; never raise.
+SMTP_FILE_DEFAULT = "/root/.healthcheck-smtp"
 
-    True if at least one channel took it, or if none is configured (nothing to
-    retry). Rate-limit markers are only written on True, so an ntfy outage at
-    alert time retries next run instead of going silent for DEGRADED_REALERT_H.
+
+def _smtp_config() -> dict | None:
+    """Parse the root-only SMTP KEY=VALUE file; None if email is not set up.
+
+    Tiny stdlib parser: `#` comment lines and blanks are skipped, values may be
+    wrapped in single or double quotes. Email counts as configured only when the
+    file exists and has SMTP_USER, SMTP_PASS and SMTP_TO.
     """
+    path = os.environ.get("HEALTHCHECK_SMTP_FILE") or SMTP_FILE_DEFAULT
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except (OSError, ValueError):
+        return None
+    kv: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        kv[key.strip().upper()] = val
+    user = kv.get("SMTP_USER", "").strip()
+    # Google shows App Passwords in 4-char groups; the spaces are not part of it.
+    password = "".join(kv.get("SMTP_PASS", "").split())
+    to = [a.strip() for a in kv.get("SMTP_TO", "").split(",") if a.strip()]
+    if not (user and password and to):
+        return None
+    try:
+        port = int(kv.get("SMTP_PORT") or 587)
+    except ValueError:
+        port = 587
+    return {
+        "host": kv.get("SMTP_HOST") or "smtp.gmail.com",
+        "port": port,
+        "user": user,
+        "password": password,
+        "to": to,
+        "from": kv.get("SMTP_FROM") or user,
+    }
+
+
+# Short reason of the most recent failed email, so --test-email can show it.
+_last_email_error = ""
+
+
+def _send_email(cfg: dict, msg: str, title: str) -> bool:
+    """Send one email via SMTP; never raise, never log the password."""
+    global _last_email_error
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        m = EmailMessage()
+        m["Subject"] = f"[trader] {title}"
+        m["From"] = cfg["from"]
+        m["To"] = ", ".join(cfg["to"])
+        m.set_content(f"{msg}\n\n{now}")
+        # smtplib's own default context does not verify the server certificate,
+        # which would hand SMTP_PASS to anything that can intercept the hop.
+        tls = ssl.create_default_context()
+        if cfg["port"] == 465:
+            conn = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20, context=tls)
+        else:
+            conn = smtplib.SMTP(cfg["host"], cfg["port"], timeout=20)
+        with conn as s:
+            if cfg["port"] != 465:
+                s.starttls(context=tls)
+            s.login(cfg["user"], cfg["password"])
+            s.send_message(m)
+        return True
+    except Exception as e:
+        reason = " ".join(str(e).split()).replace(cfg["password"], "***")[:120]
+        _last_email_error = f"{type(e).__name__}: {reason}"
+        try:
+            with HEALTH_LOG.open("a") as f:
+                f.write(f"{now} EMAIL_FAIL {_last_email_error}\n")
+        except OSError:
+            pass
+        return False
+
+
+def _send_channels(msg: str, title: str, priority: str) -> dict[str, bool]:
+    """Try every configured channel; map channel name -> accepted. Never raises."""
+    results: dict[str, bool] = {}
     topic = os.environ.get("HEALTHCHECK_NTFY_TOPIC")
     hook = os.environ.get("HEALTHCHECK_WEBHOOK")
-    delivered = not (topic or hook)
     if topic:
         try:
-            headers = {"Title": title, "Priority": priority}
-            email = os.environ.get("HEALTHCHECK_NTFY_EMAIL")
-            if email:
-                headers["Email"] = email
             req = urllib.request.Request(
                 f"https://ntfy.sh/{topic}",
                 data=msg.encode(),
-                headers=headers,
+                headers={"Title": title, "Priority": priority},
             )
             urllib.request.urlopen(req, timeout=15)
-            delivered = True
+            results["ntfy"] = True
         except Exception:
-            pass
+            results["ntfy"] = False
 
     if hook:
         try:
@@ -169,10 +262,26 @@ def _send(msg: str, title: str, priority: str) -> bool:
                 headers={"Content-Type": "application/json"},
             )
             urllib.request.urlopen(req, timeout=15)
-            delivered = True
+            results["webhook"] = True
         except Exception:
-            pass
-    return delivered
+            results["webhook"] = False
+
+    cfg = _smtp_config()
+    if cfg:
+        results["email"] = _send_email(cfg, msg, title)
+    return results
+
+
+def _send(msg: str, title: str, priority: str) -> bool:
+    """Send msg to ntfy, the webhook and email, whichever are configured; never raise.
+
+    True if at least one channel took it, or if none is configured (nothing to
+    retry). Rate-limit markers are only written on True, so an outage of every
+    channel at alert time retries next run instead of going silent for
+    DEGRADED_REALERT_H.
+    """
+    results = _send_channels(msg, title, priority)
+    return not results or any(results.values())
 
 
 def notify_degraded(msg: str, marker: Path | None = None,
@@ -335,5 +444,29 @@ def main() -> int:
     return 0
 
 
+def send_test_message() -> int:
+    """--test-email: one message through _send's channels; touches no marker."""
+    results = _send_channels("healthcheck test message: if you can read this, "
+                             "alert delivery works.", "healthcheck test", "default")
+    if not results:
+        print("no channel configured (set HEALTHCHECK_NTFY_TOPIC, "
+              "HEALTHCHECK_WEBHOOK or the SMTP file)")
+        return 1
+    for name, ok in results.items():
+        print(f"{name}: {'accepted' if ok else 'FAILED'}")
+    if results.get("email") is False:
+        print(f"email error: {_last_email_error}")
+    accepted = [n for n, ok in results.items() if ok]
+    print("accepted by: " + (", ".join(accepted) if accepted else "none"))
+    return 0 if accepted else 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    ap = argparse.ArgumentParser(description="trader.py heartbeat watchdog")
+    ap.add_argument("--test-email", action="store_true",
+                    help="send one test message through every configured alert "
+                         "channel and exit 0 if at least one accepted it")
+    # parse_known_args: an unexpected argument from some cron wrapper must not
+    # turn the watchdog into an exit-2 no-op.
+    args, _unknown = ap.parse_known_args()
+    sys.exit(send_test_message() if args.test_email else main())
