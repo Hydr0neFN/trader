@@ -402,7 +402,6 @@ ANALYST_SYSTEM = (
 GEMINI_MODEL_PRIORITY = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",             # answered 5 of 5 free-tier probes
-    "gemini-3.7-flash",
     "gemini-3.5-flash",
     "gemini-3-flash-preview",
     "gemini-2.5-flash",
@@ -969,7 +968,7 @@ GEMINI_CLI_PATH       = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
 # is honoured for backward compat (becomes the head of the chain).
 # Same free-tier reality as GEMINI_MODEL_PRIORITY above: the three Pro entries
 # reported quotaValue 0 and only ever cost a 429 and a retry delay.
-_default_cli_chain = "gemini-3.8-flash,gemini-3.6-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash"
+_default_cli_chain = "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash"
 _legacy_single = os.environ.get("GEMINI_CLI_EXIT_MODEL")
 GEMINI_CLI_EXIT_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_CLI_EXIT_MODELS", _legacy_single or _default_cli_chain).split(",")
