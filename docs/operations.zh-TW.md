@@ -26,7 +26,7 @@ token 只需要 **Account > Workers AI > Read** 權限。
 
 ## 透過訂閱使用 Claude Sonnet（選用）
 
-這會讓風險／出場關卡透過 Claude Agent SDK 改跑 Claude **Sonnet**。
+這樣風險／出場關卡會改用 Claude Agent SDK 跑 Claude **Sonnet**。
 用的是您 **Claude Pro 方案內含的額度**，不是按量計費的 Haiku API token。
 加上 `CLAUDE_CODE_OAUTH_TOKEN`（用 `claude setup-token` 取得）就會啟用。
 
@@ -41,7 +41,7 @@ token 只需要 **Account > Workers AI > Read** 權限。
 
 這種用法違反 DeepSeek 的服務條款，所以帳號隨時可能被封，token 也可能無預警過期。
 兩種情況都會以 HTTP 錯誤（401/403/429/5xx）的形式出現。
-代理在併發下撐不住，所以 DeepSeek 的呼叫一律**循序**進行。
+代理同時處理多個請求就撐不住，所以 DeepSeek 的呼叫一律**循序**進行。
 每一輪執行都有**斷路器**：連續失敗 3 次後，這一輪剩下的部分就不再呼叫 DeepSeek。
 這樣一次故障頂多只浪費幾次逾時的成本。
 
@@ -57,7 +57,7 @@ DeepSeek 掛掉時，機器人只少了第一段。
 
 *選用。* 設定 `USE_AGY_GEMINI=1` 後，分析師與出場分析師會改走 `agy` CLI。
 用的是 Google AI 訂閱的額度，不是 Gemini API 金鑰。
-這份額度是以算力計量，而且每**週**重置，所以用完就是鎖上好幾天，不是隔天就恢復。
+這份額度是以算力計量，而且每**週**重置，所以用完就會被鎖上好幾天，隔天不會恢復。
 只要 agy 出任何問題，就會自動退回 API 鏈。
 DeepSeek 也啟用時，agy 是第二段，DeepSeek 失敗後才會輪到它。
 
@@ -68,7 +68,7 @@ DeepSeek 也啟用時，agy 是第二段，DeepSeek 失敗後才會輪到它。
 *選用。* 設定 `EXIT_GATE=1` 後，LLM 出場檢視只會針對股價低於 5 日均線的部位。
 在 19,654 筆歷史檢視上實測，這樣可以省下約 65% 的出場分析師呼叫，同時仍能找出 73% 實際執行的出場。
 市場資料不能用時，它會放行（fail open）。
-預設是關的：只有在卡住的是額度、而不是準確度的時候，這筆取捨才划算。
+預設是關的：只有瓶頸在額度、準確度還夠用的時候，這筆取捨才划算。
 
 ## 成本紀錄
 
@@ -133,7 +133,7 @@ python3 trader.py
 它有自己的標記 `trade_logs/DEEPSEEK_DOWN`，所以頻率限制跟降級警報分開算（同樣是 12 小時的間隔）。
 
 **DeepSeek 恢復了。** DeepSeek 又能回應時，healthcheck 會送出一則 **DeepSeek recovered** 訊息。
-但只有在乾淨的一輪之後才會送（至少一次成功呼叫、沒有失敗，斷路器也沒跳開）。
+但要等到一輪完全正常之後才會送（至少一次成功呼叫、沒有失敗，斷路器也沒跳開）。
 標記不會被刪掉，而是改寫成 `<original alert timestamp> RECOVERED`。
 原本的時間戳記繼續限制「掛了」警報的頻率。
 `RECOVERED` 標籤則讓「恢復了」訊息每次故障只送一次。
@@ -189,7 +189,7 @@ ntfy.sh 會用 HTTP 400（`anonymous email sending is not allowed`）拒絕 `Ema
 `/positions` 保留為導向 `/` 的轉址，舊連結照樣能用。
 
 頁尾與決策卡片上的模型名稱，是在畫面產生時從 log 推出來的，不是手寫的，所以不會跟機器人實際呼叫的模型脫節。
-標籤寫的是角色（`Sentiment`），不是廠商，理由相同：那一段背後的供應商會換。
+標籤寫角色（`Sentiment`），不寫廠商，理由相同：那一段背後的供應商會換。
 分析師徽章（`DeepSeek: BUY`、`Gemini: HOLD`）是唯一會寫出廠商名稱的地方。
 它顯示的是實際回答的供應商，依每一列的模型標籤判斷（`ds:` → DeepSeek，`agy:`、`cli:` 或 `gemini…` → Gemini；空白、`none` 或其他 → 通用的 `Analyst`）。
 固定的欄位標題一律只寫 `Analyst`。
