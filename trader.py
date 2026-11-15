@@ -400,6 +400,7 @@ ANALYST_SYSTEM = (
 # costs less than letting the fallback path reach different verdicts than the
 # primary one.
 GEMINI_MODEL_PRIORITY = [
+    "gemini-4-hydrogen",            # 2026-11-15: API id assumed from the agy slug; unverified (a 404 is skipped)
     "gemini-3.8-flash",
     "gemini-3.6-flash",             # answered 5 of 5 free-tier probes
     "gemini-3.5-flash",
@@ -989,7 +990,9 @@ USE_GEMINI_EXIT_CLI   = os.environ.get("USE_GEMINI_EXIT_CLI", "0").lower() in ("
 # lockout with no intra-day refill on the AI Plus tier. When USE_AGY_GEMINI=1 the
 # analyst and exit analyst try agy first and fall back to the Gemini API chain.
 AGY_BIN        = os.environ.get("AGY_BIN", str(Path.home() / ".local" / "bin" / "agy"))
-# Default is 3.8 Flash (High) as of 2026-09-04. Google's own evals put 3.8 ahead of
+# Default is Gemini 4 Hydrogen (High) as of 2026-11-15 (Google AI Pro; agy lists it; 3.8 Flash
+# stays in the API fallback chain). Previous default: 3.8 Flash (High) as of 2026-09-04.
+# Google's own evals put 3.8 ahead of
 # 3.7 on every task family reported, including the financial-analyst set that is the
 # closest published analogue to this bot's work (61.4% vs 59.0%), at the same price.
 # There is no independent measurement on this specific task yet -- solver-verified-bench
@@ -999,7 +1002,7 @@ AGY_BIN        = os.environ.get("AGY_BIN", str(Path.home() / ".local" / "bin" / 
 # so a model change here can quietly silence the AI exit path.
 # If subscription quota gets tight, drop to "(Medium)" before changing generation;
 # the effort tier costs more than the generation does.
-AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 3.8 Flash (High)")
+AGY_MODEL      = os.environ.get("AGY_MODEL", "Gemini 4 Hydrogen (High)")
 AGY_TIMEOUT    = int(os.environ.get("AGY_TIMEOUT", "120"))
 USE_AGY_GEMINI = os.environ.get("USE_AGY_GEMINI", "0").lower() in ("1", "true", "yes")
 
